@@ -11,8 +11,9 @@
 
 **The recommended workflow:**
 1. Flash `SpacePi_Dryer_OTA.ino` **once via USB** (follow steps below)
-2. Every future update: upload wirelessly from Arduino IDE over WiFi — no cable ever again
-3. Develop and iterate your own changes without opening the enclosure
+2. password: `dryer2024`
+3. Every future update: upload wirelessly from Arduino IDE over WiFi — no cable ever again
+4. Develop and iterate your own changes without opening the enclosure
 
 ---
 
