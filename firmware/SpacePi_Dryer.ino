@@ -1,5 +1,5 @@
 /*
- * SpacePi Dryer — custom ESP32 controller — Mod v01 Mike (firmware v10 OTA — corrected display layouts)
+ * SpacePi Dryer — custom ESP32 controller — Mod v01 Mike (firmware v9 OTA — root-cause state separation)
  *
  * OTA: Tools->Port->spacepi-dryer, password: dryer2024
  * Board: Elecrow 3.5" ESP32-WROOM-32 HMI (ILI9488 480x320, resistive touch)
@@ -10,7 +10,6 @@
  * v2: flicker-free draws (padding + sprites), flame + dual 4-blade fan
  * animation, gradient UI, run-screensaver, on-screen WiFi setup keyboard.
  * SAFETY: idle standby and active-cycle screensaver are separate states.
- * v10: all four run layouts corrected; continuous animation removed to stop flicker.
  * Heater control is impossible from standby.
  */
 
@@ -31,7 +30,7 @@ const char* AP_PASS   = "dryer1234";
 const char* TZ_INFO   = "CET-1CEST,M3.5.0,M10.5.0/3";  // Germany
 const char* OTA_HOSTNAME = "spacepi-dryer";
 const char* OTA_PASSWORD = "dryer2024";
-#define TOUCH_THRESHOLD  300       // reject resistive-panel noise; confirmed presses are debounced below
+#define TOUCH_THRESHOLD  145       // keep proven panel sensitivity; software filters false presses
 #define ENABLE_IDLE_CLOCK 1         // 1 = show clock after timeout
 #define IDLE_TIMEOUT_MS  30000UL   // used only when ENABLE_IDLE_CLOCK is 1
 #define SAVER_TIMEOUT_MS 60000UL   // screensaver after 1 min untouched while drying
@@ -747,91 +746,56 @@ void touchHome(int tx, int ty) {
 // ---------------------------------------------------------------
 //                      RUN SCREEN
 // ---------------------------------------------------------------
-uint32_t runUiGeneration = 0;
-
 void drawRunStatic() {
   char title[32];
   snprintf(title, sizeof(title), "%s  target %d C", presets[selPreset].name, setTemp);
   newScreen(title);
-  runUiGeneration++;   // forces every dynamic field to be drawn once for the new layout
-
   switch (mainTheme % 4) {
     case 0: // Modern Cards
       tft.fillRoundRect(12,44,220,104,12,C_CARD);
       tft.fillRoundRect(248,44,220,104,12,C_CARD);
       tft.fillRoundRect(12,158,456,60,12,C_CARD);
-      tft.setTextColor(C_MUTED,C_CARD); tft.setTextDatum(MC_DATUM);
-      tft.drawString("TEMPERATURE",122,58,2);
-      tft.drawString("HUMIDITY",358,58,2);
+      tft.setTextDatum(MC_DATUM); tft.setTextColor(C_MUTED,C_CARD);
+      tft.drawString("TEMPERATURE",122,58,2); tft.drawString("HUMIDITY",358,58,2);
       tft.drawString("TIME REMAINING",240,168,2);
       break;
-
-    case 1: // Circular Dial — no redundant heater bars
+    case 1: // Circular Dial
       tft.fillRoundRect(12,72,112,104,12,C_CARD);
       tft.fillRoundRect(356,72,112,104,12,C_CARD);
-      tft.fillCircle(240,145,80,C_BG);
-      tft.drawCircle(240,145,91,0x047F);
-      tft.drawCircle(240,145,82,0x025F);
+      tft.fillCircle(240,145,76,C_BG);
+      tft.drawCircle(240,145,91,0x047F); tft.drawCircle(240,145,82,0x025F);
       tft.drawArc(240,145,91,86,210,330,C_ACCENT,C_BG);
       tft.drawArc(240,145,91,86,30,145,C_HOT,C_BG);
-      tft.setTextColor(C_MUTED,C_CARD); tft.setTextDatum(MC_DATUM);
-      tft.drawString("TEMP",68,92,2);
-      tft.drawString("HUMIDITY",412,92,2);
-      tft.setTextColor(C_MUTED,C_BG);
-      tft.drawString("TIME REMAINING",240,105,2);
+      tft.setTextDatum(MC_DATUM); tft.setTextColor(C_MUTED,C_CARD);
+      tft.drawString("TEMP",68,82,2); tft.drawString("HUM",412,82,2);
+      tft.setTextColor(C_MUTED,C_BG); tft.drawString("TIME REMAINING",240,108,2);
       break;
-
     case 2: // Minimal Industrial
-      tft.fillRoundRect(12,74,456,142,12,0x080F);
-      tft.drawFastHLine(14,72,452,0x2945);
-      tft.drawFastHLine(14,218,452,0x2945);
-      tft.setTextDatum(TL_DATUM); tft.setTextColor(C_MUTED,C_BG);
-      tft.drawString("TEMPERATURE",18,80,2);
-      tft.setTextDatum(TR_DATUM);
-      tft.drawString("HUMIDITY",462,80,2);
-      tft.setTextDatum(MC_DATUM);
-      tft.drawString("TIME REMAINING",240,124,2);
+      tft.fillRoundRect(12,72,456,146,10,0x080F);
+      tft.setTextDatum(TL_DATUM); tft.setTextColor(C_MUTED,0x080F); tft.drawString("TEMPERATURE",18,80,2);
+      tft.setTextDatum(TR_DATUM); tft.drawString("HUMIDITY",462,80,2);
+      tft.setTextDatum(MC_DATUM); tft.drawString("TIME REMAINING",240,124,2);
       break;
-
     default: // Split Dashboard
       tft.fillRoundRect(12,44,220,82,12,C_CARD);
       tft.fillRoundRect(248,44,220,82,12,C_CARD);
       tft.fillRoundRect(12,136,456,82,12,0x1108);
       tft.setTextDatum(MC_DATUM); tft.setTextColor(C_MUTED,C_CARD);
-      tft.drawString("TEMPERATURE",122,58,2);
-      tft.drawString("HUMIDITY",358,58,2);
-      tft.setTextColor(C_MUTED,0x1108);
-      tft.drawString("TIME REMAINING",240,150,2);
+      tft.drawString("TEMPERATURE",122,58,2); tft.drawString("HUMIDITY",358,58,2);
+      tft.setTextColor(C_MUTED,0x1108); tft.drawString("TIME REMAINING",240,150,2);
       break;
   }
-
-  // Stable bottom controls. Do not redraw heater state here: thermostat cycling
-  // caused the visible orange-bar flashing in the previous layouts.
   tft.fillRoundRect(12,228,338,28,8,C_CARD);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(C_MUTED,C_CARD);
-  char info[48];
-  snprintf(info,sizeof(info),"Target %d C   Fan %s",setTemp,fanOn ? "ON" : "OFF");
-  tft.drawString(info,181,242,2);
   btn(368,262,100,50,"STOP",C_BAD);
   tft.setTextDatum(TL_DATUM);
 }
 
-void drawStatusBadges(bool force = false) {
-  static bool lastFan = false;
-  static uint32_t lastGeneration = 0;
-  if (!force && lastGeneration == runUiGeneration && lastFan == fanOn) return;
-  lastGeneration = runUiGeneration;
-  lastFan = fanOn;
+void drawStatusBadges() {
   tft.fillRoundRect(12,228,338,28,8,C_CARD);
   char info[48];
-  snprintf(info,sizeof(info),"Target %d C   Fan %s",setTemp,fanOn ? "ON" : "OFF");
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(C_MUTED,C_CARD);
-  tft.setTextPadding(322);
-  tft.drawString(info,181,242,2);
-  tft.setTextPadding(0);
-  tft.setTextDatum(TL_DATUM);
+  snprintf(info,sizeof(info),"Target %d C   Fan %s",setTemp,fanOn?"ON":"OFF");
+  tft.setTextDatum(MC_DATUM); tft.setTextColor(C_MUTED,C_CARD);
+  tft.drawString(info,181,242,2); tft.setTextDatum(TL_DATUM);
 }
 
 void drawRunDynamic() {
@@ -839,112 +803,32 @@ void drawRunDynamic() {
   snprintf(temp,sizeof(temp),"%.1f C",dispTemp);
   snprintf(hum,sizeof(hum),"%.0f %%RH",dispHum);
   fmtTimeLeft(tl,sizeof(tl));
-  unsigned long total = max(1UL, runEndMs - runStartMs);
-  int progress = (int)(100.0f * min(1.0f,(float)(millis()-runStartMs)/(float)total));
-
-  static char oldTemp[18] = "";
-  static char oldHum[18] = "";
-  static char oldTl[18] = "";
-  static int oldProgress = -1;
-  static uint8_t oldTheme = 255;
-  static uint32_t oldGeneration = 0;
-
-  bool force = oldGeneration != runUiGeneration || oldTheme != (mainTheme % 4);
-  bool tempChanged = force || strcmp(oldTemp,temp) != 0;
-  bool humChanged = force || strcmp(oldHum,hum) != 0;
-  bool timeChanged = force || strcmp(oldTl,tl) != 0;
-  bool progressChanged = force || oldProgress != progress;
-
-  oldGeneration = runUiGeneration;
-  oldTheme = mainTheme % 4;
-  strcpy(oldTemp,temp); strcpy(oldHum,hum); strcpy(oldTl,tl);
-  oldProgress = progress;
-
+  unsigned long total=max(1UL,runEndMs-runStartMs);
+  int progress=(int)(100.0f*min(1.0f,(float)(millis()-runStartMs)/(float)total));
   tft.setTextDatum(MC_DATUM);
-  switch (mainTheme % 4) {
-    case 0: // Modern Cards
-      if (tempChanged) {
-        tft.setTextColor(C_HOT,C_CARD); tft.setTextPadding(190);
-        tft.drawString(temp,122,100,5); tft.setTextPadding(0);
-      }
-      if (humChanged) {
-        tft.setTextColor(C_ACCENT,C_CARD); tft.setTextPadding(190);
-        tft.drawString(hum,358,100,5); tft.setTextPadding(0);
-      }
-      if (timeChanged) {
-        tft.setTextColor(C_TEXT,C_CARD); tft.setTextPadding(300);
-        tft.drawString(tl,240,194,5); tft.setTextPadding(0);
-      }
-      if (progressChanged) {
-        tft.fillRect(18,210,444,5,0x2945);
-        tft.fillRect(18,210,444*progress/100,5,C_ACCENT);
-      }
-      break;
-
-    case 1: // Circular Dial
-      if (tempChanged) {
-        tft.setTextColor(C_HOT,C_CARD); tft.setTextPadding(96);
-        tft.drawString(temp,68,132,4); tft.setTextPadding(0);
-      }
-      if (humChanged) {
-        tft.setTextColor(C_ACCENT,C_CARD); tft.setTextPadding(96);
-        tft.drawString(hum,412,132,4); tft.setTextPadding(0);
-      }
-      if (timeChanged) {
-        // Font 4 is deliberately used: font 5 was too wide and could disappear.
-        tft.setTextColor(C_TEXT,C_BG); tft.setTextPadding(166);
-        tft.drawString(tl,240,148,4); tft.setTextPadding(0);
-      }
-      if (progressChanged) {
-        char pc[12]; snprintf(pc,sizeof(pc),"%d %%",progress);
-        tft.setTextColor(C_MUTED,C_BG); tft.setTextPadding(90);
-        tft.drawString(pc,240,184,2); tft.setTextPadding(0);
-      }
-      break;
-
-    case 2: // Minimal Industrial
-      if (tempChanged) {
-        tft.setTextColor(C_HOT,0x080F); tft.setTextDatum(TL_DATUM);
-        tft.setTextPadding(190); tft.drawString(temp,18,98,4); tft.setTextPadding(0);
-      }
-      if (humChanged) {
-        tft.setTextColor(C_ACCENT,0x080F); tft.setTextDatum(TR_DATUM);
-        tft.setTextPadding(190); tft.drawString(hum,462,98,4); tft.setTextPadding(0);
-      }
-      tft.setTextDatum(MC_DATUM);
-      if (timeChanged) {
-        // Use a supported, fitting font so the countdown is always visible.
-        tft.setTextColor(C_TEXT,0x080F); tft.setTextPadding(330);
-        tft.drawString(tl,240,170,6); tft.setTextPadding(0);
-      }
-      if (progressChanged) {
-        tft.fillRect(18,206,444,7,0x2945);
-        tft.fillRect(18,206,444*progress/100,7,C_ACCENT);
-      }
-      break;
-
-    default: // Split Dashboard
-      if (tempChanged) {
-        tft.setTextDatum(MC_DATUM); tft.setTextColor(C_HOT,C_CARD);
-        tft.setTextPadding(190); tft.drawString(temp,122,92,4); tft.setTextPadding(0);
-      }
-      if (humChanged) {
-        tft.setTextDatum(MC_DATUM); tft.setTextColor(C_ACCENT,C_CARD);
-        tft.setTextPadding(190); tft.drawString(hum,358,92,4); tft.setTextPadding(0);
-      }
-      if (timeChanged) {
-        tft.setTextDatum(MC_DATUM); tft.setTextColor(C_TEXT,0x1108);
-        tft.setTextPadding(310); tft.drawString(tl,240,181,5); tft.setTextPadding(0);
-      }
-      if (progressChanged) {
-        tft.fillRect(24,205,432,5,0x2945);
-        tft.fillRect(24,205,432*progress/100,5,C_ACCENT);
-      }
-      break;
+  switch(mainTheme%4){
+    case 0:
+      tft.fillRect(20,72,204,62,C_CARD); tft.setTextColor(C_HOT,C_CARD); tft.drawString(temp,122,101,4);
+      tft.fillRect(256,72,204,62,C_CARD); tft.setTextColor(C_ACCENT,C_CARD); tft.drawString(hum,358,101,4);
+      tft.fillRect(24,180,432,28,C_CARD); tft.setTextColor(C_TEXT,C_CARD); tft.drawString(tl,240,194,4);
+      tft.fillRect(18,210,444,5,0x2945); tft.fillRect(18,210,444*progress/100,5,C_ACCENT); break;
+    case 1:
+      tft.fillRect(14,96,108,60,C_CARD); tft.setTextColor(C_HOT,C_CARD); tft.drawString(temp,68,126,2);
+      tft.fillRect(358,96,108,60,C_CARD); tft.setTextColor(C_ACCENT,C_CARD); tft.drawString(hum,412,126,2);
+      tft.fillCircle(240,151,70,C_BG); tft.setTextColor(C_TEXT,C_BG); tft.drawString(tl,240,151,4);
+      {char pc[12];snprintf(pc,sizeof(pc),"%d %%",progress);tft.setTextColor(C_MUTED,C_BG);tft.drawString(pc,240,186,2);} break;
+    case 2:
+      tft.fillRect(18,98,180,36,0x080F); tft.setTextDatum(TL_DATUM); tft.setTextColor(C_HOT,0x080F); tft.drawString(temp,18,101,4);
+      tft.fillRect(282,98,180,36,0x080F); tft.setTextDatum(TR_DATUM); tft.setTextColor(C_ACCENT,0x080F); tft.drawString(hum,462,101,4);
+      tft.setTextDatum(MC_DATUM); tft.fillRect(70,145,340,50,0x080F); tft.setTextColor(C_TEXT,0x080F); tft.drawString(tl,240,170,4);
+      tft.fillRect(18,206,444,7,0x2945); tft.fillRect(18,206,444*progress/100,7,C_ACCENT); break;
+    default:
+      tft.fillRect(20,76,204,38,C_CARD); tft.setTextColor(C_HOT,C_CARD); tft.drawString(temp,122,94,4);
+      tft.fillRect(256,76,204,38,C_CARD); tft.setTextColor(C_ACCENT,C_CARD); tft.drawString(hum,358,94,4);
+      tft.fillRect(40,166,400,36,0x1108); tft.setTextColor(C_TEXT,0x1108); tft.drawString(tl,240,183,4);
+      tft.fillRect(24,205,432,5,0x2945); tft.fillRect(24,205,432*progress/100,5,C_ACCENT); break;
   }
-
-  tft.setTextDatum(TL_DATUM);
-  drawStatusBadges(force);
+  tft.setTextDatum(TL_DATUM); drawStatusBadges();
 }
 
 // animation strip: two 4-blade fans + flame, sprite = no flicker
@@ -1027,21 +911,22 @@ void touchRun(int tx, int ty) {
 void enterSaver(bool fromHome = false) {
   if (sensorOk) {
     saverTemp = curTemp;
-    saverHum = curHum;
+    saverHum  = curHum;
     saverHasData = true;
     dispTemp = curTemp;
-    dispHum = curHum;
+    dispHum  = curHum;
   }
   lastHumUpdateMs = millis();
   screen = fromHome ? SCR_STANDBY : SCR_SAVER;
+  if (fromHome) idleMode = true;   // prevent drawHomeLive from firing over standby
+  tft.fillScreen(TFT_BLACK);       // clear previous screen ONCE on entry — not on every redraw
   drawSaver();
 }
 
 void drawSaverFrame() {
-  // Draw into one full-screen sprite and push once. No per-digit overdraw,
-  // therefore no ghost fragments. In anti-flicker mode this runs only once/second.
-  sanim.fillSprite(TFT_BLACK);
-  sanim.setTextDatum(MC_DATUM);
+  // NO fillScreen — causes flicker. Each element erases its own area via background fill.
+  // On theme entry (enterSaver) a single fillScreen is done; subsequent redraws are incremental.
+  tft.setTextDatum(MC_DATUM);
   char tl[16];
   if (screen == SCR_STANDBY) strcpy(tl, "STANDBY"); else fmtTimeLeft(tl, sizeof(tl));
   char temp[16], hum[16];
@@ -1049,60 +934,101 @@ void drawSaverFrame() {
   else { strcpy(temp,"--.- C"); strcpy(hum,"-- %RH"); }
 
   switch (saverTheme % 4) {
-    case 0: { // Minimal Glow
-      sanim.setTextColor(C_MUTED,TFT_BLACK); sanim.drawString(screen == SCR_STANDBY ? "STANDBY" : "DRYING",240,34,2);
-      sanim.setTextColor(C_ACCENT,TFT_BLACK); sanim.drawString(clockStr,240,112,7);
-      sanim.setTextColor(C_HOT,TFT_BLACK); sanim.drawString(temp,90,22,2);
-      sanim.setTextColor(C_ACCENT,TFT_BLACK); sanim.drawString(hum,390,22,2);
-      sanim.drawFastHLine(90,180,300,0x18C5);
-      sanim.setTextColor(C_MUTED,TFT_BLACK); sanim.drawString("touch to wake",240,292,2);
+    case 0: { // Minimal Glow — text with matching bg erases old value
+      tft.setTextColor(C_MUTED,TFT_BLACK); tft.setTextPadding(200);
+      tft.drawString(screen == SCR_STANDBY ? "STANDBY" : "DRYING",240,34,2);
+      tft.setTextColor(C_ACCENT,TFT_BLACK); tft.setTextPadding(360);
+      tft.drawString(clockStr,240,112,6);
+      tft.setTextColor(C_HOT,TFT_BLACK); tft.setTextPadding(130);
+      tft.drawString(temp,90,22,2);
+      tft.setTextColor(C_ACCENT,TFT_BLACK); tft.setTextPadding(130);
+      tft.drawString(hum,390,22,2);
+      tft.drawFastHLine(90,180,300,0x18C5);
+      tft.setTextColor(C_MUTED,TFT_BLACK); tft.setTextPadding(200);
+      tft.drawString("touch to wake",240,292,2);
+      tft.setTextPadding(0);
       break;
     }
-    case 1: { // Data Cards
-      sanim.fillRoundRect(18,18,210,82,12,C_CARD); sanim.fillRoundRect(252,18,210,82,12,C_CARD);
-      sanim.setTextColor(C_MUTED,C_CARD); sanim.drawString("TEMPERATURE",123,38,2); sanim.drawString("HUMIDITY",357,38,2);
-      sanim.setTextColor(C_HOT,C_CARD); sanim.drawString(temp,123,72,4);
-      sanim.setTextColor(C_ACCENT,C_CARD); sanim.drawString(hum,357,72,4);
-      sanim.setTextColor(C_ACCENT,TFT_BLACK); sanim.drawString(clockStr,240,150,7);
-      sanim.setTextColor(C_TEXT,TFT_BLACK); sanim.drawString(tl,240,218,4);
-      sanim.fillRoundRect(75,252,330,36,10,C_CARD);
-      sanim.setTextColor(C_MUTED,C_CARD); sanim.drawString(screen == SCR_STANDBY ? "Standby   heater " : "Drying   heater ",180,270,2);
-      sanim.setTextColor(heaterOn?C_HOT:C_MUTED,C_CARD); sanim.drawString(heaterOn?"ON":"OFF",285,270,2);
-      sanim.setTextColor(fanOn?C_ACCENT:C_MUTED,C_CARD); sanim.drawString(fanOn?"fan ON":"fan OFF",355,270,2);
+    case 1: { // Data Cards — cards act as background, no flicker
+      tft.fillRoundRect(18,18,210,82,12,C_CARD); tft.fillRoundRect(252,18,210,82,12,C_CARD);
+      tft.setTextColor(C_MUTED,C_CARD); tft.drawString("TEMPERATURE",123,38,2);
+      tft.drawString("HUMIDITY",357,38,2);
+      tft.setTextColor(C_HOT,C_CARD); tft.setTextPadding(190);
+      tft.drawString(temp,123,72,4);
+      tft.setTextColor(C_ACCENT,C_CARD); tft.setTextPadding(190);
+      tft.drawString(hum,357,72,4);
+      tft.setTextColor(C_ACCENT,TFT_BLACK); tft.setTextPadding(360);
+      tft.drawString(clockStr,240,150,6);
+      tft.setTextColor(C_TEXT,TFT_BLACK); tft.setTextPadding(250);
+      tft.drawString(tl,240,218,4);
+      tft.fillRoundRect(75,252,330,36,10,C_CARD);
+      tft.setTextColor(C_MUTED,C_CARD); tft.setTextPadding(0);
+      tft.drawString(screen == SCR_STANDBY ? "Standby   heater " : "Drying   heater ",180,270,2);
+      tft.setTextColor(heaterOn?C_HOT:C_MUTED,C_CARD);
+      tft.drawString(heaterOn?"ON ":"OFF",285,270,2);
+      tft.setTextColor(fanOn?C_ACCENT:C_MUTED,C_CARD);
+      tft.drawString(fanOn?"fan ON ":"fan OFF",355,270,2);
+      tft.setTextPadding(0);
       break;
     }
-    case 2: { // Orbit Dial
+    case 2: { // Orbit Dial — static circle drawn once on entry, text erases itself
       int cx=240,cy=155;
-      sanim.drawCircle(cx,cy,105,0x047F); sanim.drawCircle(cx,cy,96,0x025F);
-      sanim.drawArc(cx,cy,105,99,210,330,C_ACCENT,TFT_BLACK);
-      sanim.drawArc(cx,cy,105,99,30,145,C_HOT,TFT_BLACK);
-      sanim.setTextColor(C_MUTED,TFT_BLACK); sanim.drawString(screen == SCR_STANDBY ? "IDLE" : "DRYING",cx,92,2);
-      sanim.setTextColor(C_TEXT,TFT_BLACK); sanim.drawString(clockStr,cx,145,6);
-      sanim.setTextColor(C_HOT,TFT_BLACK); sanim.drawString(temp,78,155,3);
-      sanim.setTextColor(C_ACCENT,TFT_BLACK); sanim.drawString(hum,402,155,3);
-      sanim.setTextColor(C_MUTED,TFT_BLACK); sanim.drawString("touch to wake",cx,286,2);
+      tft.drawCircle(cx,cy,105,0x047F); tft.drawCircle(cx,cy,96,0x025F);
+      tft.drawArc(cx,cy,105,99,210,330,C_ACCENT,TFT_BLACK);
+      tft.drawArc(cx,cy,105,99,30,145,C_HOT,TFT_BLACK);
+      tft.setTextColor(C_MUTED,TFT_BLACK); tft.setTextPadding(160);
+      tft.drawString(screen == SCR_STANDBY ? "IDLE" : "DRYING",cx,92,2);
+      tft.setTextColor(C_TEXT,TFT_BLACK); tft.setTextPadding(320);
+      tft.drawString(clockStr,cx,145,6);
+      tft.setTextColor(C_HOT,TFT_BLACK); tft.setTextPadding(110);
+      tft.drawString(temp,78,155,2);
+      tft.setTextColor(C_ACCENT,TFT_BLACK); tft.setTextPadding(110);
+      tft.drawString(hum,402,155,2);
+      tft.setTextColor(C_MUTED,TFT_BLACK); tft.setTextPadding(200);
+      tft.drawString("touch to wake",cx,286,2);
+      tft.setTextPadding(0);
       break;
     }
-    default: { // Modern Flip, static cards (no flip animation = no ghosting)
-      sanim.setTextColor(C_HOT,TFT_BLACK); sanim.drawString(temp,90,28,2);
-      sanim.setTextColor(C_ACCENT,TFT_BLACK); sanim.drawString(hum,390,28,2);
+    default: { // Modern Flip — cards act as background, no flicker
+      tft.setTextColor(C_HOT,TFT_BLACK); tft.setTextPadding(130);
+      tft.drawString(temp,90,28,2);
+      tft.setTextColor(C_ACCENT,TFT_BLACK); tft.setTextPadding(130);
+      tft.drawString(hum,390,28,2);
+      tft.setTextPadding(0);
+      // card positions: gap between x[1] right edge and x[2] left edge
+      // x[1]=155, card w=84 -> right=155+42=197; x[2]=275, left=275-42=233
+      // colon midpoint = (197+233)/2 = 215
       const int x[4]={55,155,275,375};
+      const int colonX = 215;   // exact midpoint of gap between hour and minute cards
       char digits[5]="0000"; int di=0;
-      for (int i=0; clockStr[i] && di<4; i++) if (clockStr[i]>='0'&&clockStr[i]<='9') digits[di++]=clockStr[i];
-      for(int i=0;i<4;i++) { sanim.fillRoundRect(x[i]-42,72,84,126,10,C_CARD); sanim.drawFastHLine(x[i]-40,135,80,0x3148); char z[2]={digits[i],0}; sanim.setTextColor(C_ACCENT,C_CARD); sanim.drawString(z,x[i],135,7); }
-      sanim.fillCircle(240,115,5,C_TEXT); sanim.fillCircle(240,155,5,C_TEXT);
-      sanim.setTextColor(C_TEXT,TFT_BLACK); sanim.drawString(tl,240,230,4);
-      sanim.setTextColor(C_MUTED,TFT_BLACK); sanim.drawString("touch to wake",240,292,2);
+      for (int i=0; clockStr[i] && di<4; i++)
+        if (clockStr[i]>='0' && clockStr[i]<='9') digits[di++]=clockStr[i];
+      for(int i=0;i<4;i++) {
+        tft.fillRoundRect(x[i]-42,72,84,126,10,C_CARD);
+        tft.drawFastHLine(x[i]-40,135,80,0x3148);
+        char z[2]={digits[i],0};
+        tft.setTextColor(C_ACCENT,C_CARD);
+        tft.drawString(z,x[i],135,6);
+      }
+      // colon dots — centred in the gap at x=215
+      tft.fillCircle(colonX,107,5,C_TEXT);
+      tft.fillCircle(colonX,163,5,C_TEXT);
+      tft.setTextColor(C_TEXT,TFT_BLACK); tft.setTextPadding(200);
+      tft.drawString(tl,240,230,4);
+      tft.setTextColor(C_MUTED,TFT_BLACK); tft.setTextPadding(200);
+      tft.drawString("touch to wake",240,292,2);
+      tft.setTextPadding(0);
       break;
     }
   }
-  sanim.fillRoundRect(452,8,16,12,3,wifiUp?C_GOOD:C_MUTED);
-  sanim.pushSprite(0,0);
+  tft.fillRoundRect(452,8,16,12,3,wifiUp?C_GOOD:C_MUTED);
+  
 }
 void drawSaverAnimations() { drawSaverFrame(); }
 void drawSaver() { drawSaverFrame(); }
 void exitSaver() {
   bool wasStandby = (screen == SCR_STANDBY);
+  idleMode = false;   // clear standby flag
   tft.fillScreen(TFT_BLACK);
   if (wasStandby) {
     screen = SCR_HOME;
@@ -1236,9 +1162,11 @@ void drawSettings() {
   btn(320,42,148,36,"BACK",C_CARD);
   if(settingsPage==0){
     tft.setTextDatum(TL_DATUM); tft.setTextColor(C_MUTED,C_BG); tft.drawString("Main display style",16,84,2);
-    for(int i=0;i<4;i++){ char l[12]; snprintf(l,sizeof(l),"Style %d",i+1); themeTile(12+i*116,104,108,62,l,mainTheme==i,i,false); }
+    { const char* mn[]={"Modern","Circular","Minimal","Split"};
+      for(int i=0;i<4;i++) themeTile(12+i*116,104,108,62,mn[i],mainTheme==i,i,false); }
     tft.setTextColor(C_MUTED,C_BG); tft.drawString("Screensaver style",16,174,2);
-    for(int i=0;i<4;i++){ char l[12]; snprintf(l,sizeof(l),"Style %d",i+1); themeTile(12+i*116,194,108,62,l,saverTheme==i,i,true); }
+    { const char* sn[]={"Glow","Cards","Orbit","Flip"};
+      for(int i=0;i<4;i++) themeTile(12+i*116,194,108,62,sn[i],saverTheme==i,i,true); }
     btn(12,270,144,38,saverEnabled?"SAVER ON":"SAVER OFF",saverEnabled?C_GOOD:C_CARD,saverEnabled?0:C_TEXT);
     btn(168,270,144,38,antiFlicker?"ANTI-FLICKER ON":"ANTI-FLICKER OFF",antiFlicker?C_ACCENT:C_CARD,antiFlicker?0:C_TEXT);
     btn(324,270,144,38,"PREVIEW",C_CARD);
@@ -1462,10 +1390,7 @@ void handleCmd() {
   if (a == "theme") {
     String kind=server.arg("kind"); int v=constrain(server.arg("value").toInt(),0,3);
     if(kind=="main") mainTheme=v; else if(kind=="saver") saverTheme=v; else {server.send(400,"text/plain","bad theme kind");return;}
-    saveThemePrefs();
-    if (screen == SCR_HOME) drawHome();
-    else if (screen == SCR_RUN) { drawRunStatic(); drawRunDynamic(); }
-    else if (screen == SCR_SAVER || screen == SCR_STANDBY) drawSaverFrame();
+    saveThemePrefs(); if(screen==SCR_HOME) drawHome(); else if(screen==SCR_SAVER || screen==SCR_STANDBY) drawSaverFrame();
     server.send(200,"text/plain","theme saved"); return;
   }
   if (a == "saver_toggle") { saverEnabled=!saverEnabled; saveThemePrefs(); server.send(200,"text/plain",saverEnabled?"screensaver on":"screensaver off"); return; }
@@ -1660,39 +1585,6 @@ void startRun() {
   drawRunDynamic();
 }
 
-// Confirmed-touch filter. Raw resistive-panel noise must never reset the
-// inactivity timer or activate buttons. One action is generated per press.
-bool touchLatched = false;
-uint8_t touchStableCount = 0;
-uint16_t touchCandidateX = 0, touchCandidateY = 0;
-unsigned long touchReleaseSince = 0;
-
-bool getConfirmedTouch(uint16_t &x, uint16_t &y) {
-  uint16_t rx, ry;
-  bool raw = tft.getTouch(&rx, &ry, TOUCH_THRESHOLD);
-  unsigned long now = millis();
-  if (!raw) {
-    touchStableCount = 0;
-    if (touchLatched) {
-      if (touchReleaseSince == 0) touchReleaseSince = now;
-      if (now - touchReleaseSince > 80) { touchLatched = false; touchReleaseSince = 0; }
-    }
-    return false;
-  }
-  touchReleaseSince = 0;
-  if (touchLatched) return false;
-  if (touchStableCount == 0 || abs((int)rx-(int)touchCandidateX) > 18 || abs((int)ry-(int)touchCandidateY) > 18) {
-    touchCandidateX = rx; touchCandidateY = ry; touchStableCount = 1;
-    return false;
-  }
-  touchCandidateX = (touchCandidateX + rx) / 2;
-  touchCandidateY = (touchCandidateY + ry) / 2;
-  if (++touchStableCount < 3) return false;
-  x = touchCandidateX; y = touchCandidateY;
-  touchLatched = true; touchStableCount = 0;
-  return true;
-}
-
 // ---------------------------------------------------------------
 //                      SETUP / LOOP
 // ---------------------------------------------------------------
@@ -1710,7 +1602,7 @@ void setup() {
   tft.fillScreen(C_BG);
 
   anim.createSprite(340, 54);    // run screen animation strip
-  sanim.createSprite(480, 320);  // screensaver — full screen sprite, nothing can overwrite
+  // sanim sprite removed — drawSaverFrame draws directly to TFT (480x320 sprite exceeds ESP32 RAM)
 
   prefs.begin("dryer", false);
   saverEnabled = prefs.getBool("saver", true);
@@ -1752,6 +1644,15 @@ void setup() {
   otaInit();
   // Refresh once after Wi-Fi/NTP initialization to update the header status.
   if (screen == SCR_HOME) drawHome();
+}
+
+bool touchIsMeaningfulForCurrentScreen(uint16_t x,uint16_t y){
+  if(screen==SCR_RUN) return hit(x,y,360,252,120,68);
+  if(screen==SCR_HOME){
+    for(int i=0;i<N_PRESETS;i++){int bx=12+(i%3)*156,by=44+(i/3)*52;if(hit(x,y,bx,by,148,44))return true;}
+    return hit(x,y,12,178,456,56)||hit(x,y,12,266,456,54);
+  }
+  return true;
 }
 
 void loop() {
@@ -1800,15 +1701,15 @@ void loop() {
     lastAnimMs = now; animFrame++;
     switch (screen) {
       case SCR_RUN: {
-        // Fixed one-second cadence; fields repaint only when their displayed value changes.
-        static unsigned long lastRunUiDraw = 0;
-        if (now - lastRunUiDraw >= 1000UL) { lastRunUiDraw = now; drawRunDynamic(); }
+        drawAnimStrip();   // fans + flame animation every 120ms
+        static unsigned long lastRunDraw=0;
+        if(now-lastRunDraw>=1000UL){lastRunDraw=now;drawRunDynamic();}
         break;
       }
       case SCR_SAVER:
       case SCR_STANDBY: {
         static unsigned long lastSaverDraw = 0;
-        unsigned long saverInterval = (screen == SCR_STANDBY) ? 5000UL : (antiFlicker ? 1000UL : 500UL);
+        unsigned long saverInterval = antiFlicker ? 1000UL : 250UL;
         if (now - lastSaverDraw >= saverInterval) { lastSaverDraw = now; drawSaverAnimations(); }
         break;
       }
@@ -1821,10 +1722,16 @@ void loop() {
     }
   }
 
-  // touch
-  uint16_t tx, ty;
-  if (getConfirmedTouch(tx, ty)) {
-    lastTouchMs = now;
+  // touch: require two close readings; electrical noise must not reset standby timer
+  static bool pendingTouch=false; static uint16_t px=0,py=0; static unsigned long pendingAt=0;
+  uint16_t tx,ty; bool rawTouch=tft.getTouch(&tx,&ty,TOUCH_THRESHOLD);
+  bool confirmed=false;
+  if(rawTouch){
+    if(pendingTouch && now-pendingAt>=35 && now-pendingAt<=350 && abs((int)tx-(int)px)<24 && abs((int)ty-(int)py)<24){confirmed=true;pendingTouch=false;}
+    else if(!pendingTouch){pendingTouch=true;px=tx;py=ty;pendingAt=now;}
+  } else if(pendingTouch && now-pendingAt>350) pendingTouch=false;
+  if (confirmed) {
+    if(touchIsMeaningfulForCurrentScreen(tx,ty)) lastTouchMs=now;
     switch (screen) {
       case SCR_HOME:     touchHome(tx, ty);     break;
       case SCR_RUN:      touchRun(tx, ty);      break;
