@@ -1,0 +1,189 @@
+<!-- SpacePi Dryer Web App — Mod v01 Mike
+     Open in any browser on the same WiFi as the dryer.
+     Enter the dryer IP in Settings, tap Connect. -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SpacePi Dryer — Mod v01 Mike</title>
+<style>
+:root {
+  --bg:#0a0e1a; --bg2:#111827; --card:#1a2035; --card2:#232d45;
+  --border:#2a3a55; --text:#e8edf5; --muted:#6b7a99;
+  --accent:#0af; --hot:#f80; --good:#0c6; --bad:#e33;
+  --flame-y:#ffe040; --radius:12px; --gap:16px;
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+body { background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,sans-serif; min-height:100vh; }
+.shell { display:grid; grid-template-columns:1fr; min-height:100vh; }
+@media(min-width:768px){.shell{grid-template-columns:260px 1fr;}}
+.sidebar { background:var(--bg2); border-right:1px solid var(--border); padding:24px 20px; display:flex; flex-direction:column; gap:8px; }
+@media(max-width:767px){.sidebar{flex-direction:row;flex-wrap:wrap;padding:12px;border-right:none;border-bottom:1px solid var(--border);gap:6px;position:fixed;bottom:0;left:0;right:0;z-index:10;}}
+.logo { font-size:15px; font-weight:700; margin-bottom:8px; white-space:nowrap; }
+.logo span { color:var(--accent); font-size:11px; font-weight:400; display:block; }
+@media(max-width:767px){.logo{width:100%;margin-bottom:0;}.logo span{display:inline;margin-left:8px;}}
+.nav-btn { background:none; border:1px solid transparent; color:var(--muted); padding:10px 14px; border-radius:8px; cursor:pointer; text-align:left; font-size:14px; transition:all 0.15s; width:100%; }
+@media(max-width:767px){.nav-btn{width:auto;padding:8px 12px;font-size:11px;}}
+.nav-btn:hover { background:var(--card); color:var(--text); }
+.nav-btn.active { background:var(--card); color:var(--accent); border-color:var(--border); }
+.status-dot { width:8px; height:8px; border-radius:50%; background:var(--muted); display:inline-block; margin-right:6px; }
+.status-dot.on { background:var(--good); }
+.conn-status { font-size:12px; color:var(--muted); margin-top:auto; padding-top:16px; }
+@media(max-width:767px){.conn-status{display:none;}}
+.main { padding:24px; overflow-y:auto; }
+@media(max-width:767px){.main{padding:16px;padding-bottom:80px;}}
+.page { display:none; }
+.page.active { display:block; }
+.page-header { margin-bottom:20px; }
+.page-header h1 { font-size:22px; font-weight:600; }
+.page-header p { color:var(--muted); font-size:14px; margin-top:4px; }
+.grid-2 { display:grid; grid-template-columns:repeat(2,1fr); gap:var(--gap); }
+@media(max-width:400px){.grid-2{grid-template-columns:1fr;}}
+.card { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:20px; margin-bottom:var(--gap); }
+.card-sm { padding:14px 16px; }
+.card-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.08em; margin-bottom:6px; }
+.card-value { font-size:36px; font-weight:700; line-height:1; }
+.card-value.hot { color:var(--hot); }
+.card-value.cool { color:var(--accent); }
+.card-value.sm { font-size:22px; }
+.card-sub { font-size:12px; color:var(--muted); margin-top:6px; }
+.badge { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:20px; font-size:12px; font-weight:600; }
+.badge.on  { background:rgba(0,200,100,0.15); color:var(--good); border:1px solid rgba(0,200,100,0.3); }
+.badge.off { background:rgba(100,120,160,0.15); color:var(--muted); border:1px solid var(--border); }
+.badge.heat { background:rgba(255,136,0,0.15); color:var(--hot); border:1px solid rgba(255,136,0,0.3); }
+.badge-dot { width:7px; height:7px; border-radius:50%; background:currentColor; }
+.progress-wrap { background:var(--card2); border-radius:4px; height:8px; overflow:hidden; margin:8px 0; }
+.progress-fill { height:100%; border-radius:4px; background:var(--accent); transition:width 1s linear; }
+.fault-panel { background:rgba(220,50,50,0.1); border:1px solid rgba(220,50,50,0.3); border-radius:var(--radius); padding:20px; display:none; margin-bottom:var(--gap); }
+.fault-panel.visible { display:block; }
+.fault-panel h3 { color:var(--bad); margin-bottom:8px; }
+.section-title { font-size:13px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:0.08em; margin:20px 0 10px; }
+.section-title:first-child { margin-top:0; }
+.ctrl-row { display:flex; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap; }
+.ctrl-label { font-size:13px; color:var(--muted); min-width:80px; }
+.ctrl-val { font-size:15px; font-weight:600; min-width:60px; }
+input[type=range] { flex:1; accent-color:var(--accent); min-width:120px; }
+select { background:var(--card2); border:1px solid var(--border); color:var(--text); padding:8px 12px; border-radius:8px; font-size:14px; width:100%; margin-bottom:12px; cursor:pointer; }
+.btn { display:inline-flex; align-items:center; justify-content:center; gap:8px; padding:10px 20px; border-radius:8px; font-size:14px; font-weight:600; cursor:pointer; border:none; transition:all 0.15s; margin:4px; }
+.btn-primary { background:var(--good); color:#000; }
+.btn-danger  { background:var(--bad); color:#fff; }
+.btn-neutral { background:var(--card2); color:var(--text); border:1px solid var(--border); }
+.btn-accent  { background:rgba(0,170,255,0.2); color:var(--accent); border:1px solid rgba(0,170,255,0.3); }
+.btn:disabled { opacity:0.4; cursor:not-allowed; }
+.btn-group { display:flex; gap:8px; flex-wrap:wrap; margin-top:16px; }
+.preset-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:16px; }
+@media(max-width:500px){.preset-grid{grid-template-columns:repeat(2,1fr);}}
+.preset-btn { background:var(--card2); border:1px solid var(--border); color:var(--muted); padding:10px 6px; border-radius:8px; font-size:12px; cursor:pointer; text-align:center; transition:all 0.15s; line-height:1.4; }
+.preset-btn:hover { border-color:var(--accent); color:var(--text); }
+.preset-btn.active { border-color:var(--accent); background:rgba(0,170,255,0.1); color:var(--accent); }
+.preset-name { font-weight:700; font-size:13px; display:block; }
+#toast { position:fixed; bottom:84px; right:16px; background:var(--card); border:1px solid var(--border); border-radius:8px; padding:12px 18px; font-size:13px; opacity:0; transition:opacity 0.3s; pointer-events:none; z-index:99; }
+#toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<div id="toast"></div>
+<div class="shell">
+  <nav class="sidebar">
+    <div class="logo">SpacePi Dryer <span>Mod v01 Mike</span></div>
+    <button class="nav-btn active" onclick="nav('dashboard',this)">Dashboard</button>
+    <button class="nav-btn" onclick="nav('control',this)">Control</button>
+    <button class="nav-btn" onclick="nav('history',this)">History</button>
+    <button class="nav-btn" onclick="nav('settings',this)">Settings</button>
+    <div class="conn-status"><span class="status-dot" id="conn-dot"></span><span id="conn-text">connecting…</span></div>
+  </nav>
+  <main class="main">
+    <div class="page active" id="page-dashboard">
+      <div class="page-header"><h1>Dashboard</h1><p id="dash-subtitle">Connecting…</p></div>
+      <div class="fault-panel" id="fault-panel"><h3>Fault detected</h3><p id="fault-msg" style="font-size:14px;margin-bottom:12px"></p><button class="btn btn-neutral" onclick="cmd('action=reset')">Reset (unlocks when cool)</button></div>
+      <div class="grid-2">
+        <div class="card"><div class="card-label">Temperature</div><div class="card-value hot" id="d-temp">--.-</div><div class="card-sub">deg C</div></div>
+        <div class="card"><div class="card-label">Humidity</div><div class="card-value cool" id="d-hum">--</div><div class="card-sub">%RH</div></div>
+      </div>
+      <div class="card"><div class="card-label">Time remaining</div><div class="card-value sm" id="d-timer" style="font-size:28px;font-family:monospace">--:--:--</div><div class="progress-wrap"><div class="progress-fill" id="d-progress" style="width:0%"></div></div><div class="card-sub" id="d-progress-label">idle</div></div>
+      <div class="grid-2">
+        <div class="card card-sm" style="display:flex;align-items:center;gap:12px"><canvas id="anim-flame" width="50" height="60"></canvas><div><div class="card-label">Heater</div><span class="badge off" id="d-heater-badge"><span class="badge-dot"></span>OFF</span></div></div>
+        <div class="card card-sm" style="display:flex;align-items:center;gap:12px"><canvas id="anim-fan" width="50" height="50"></canvas><div><div class="card-label">Fan</div><span class="badge off" id="d-fan-badge"><span class="badge-dot"></span>OFF</span></div></div>
+      </div>
+      <div class="card"><div class="card-label">Temperature history (last 20 min)</div><canvas id="hist-canvas" style="width:100%;height:140px;display:block"></canvas></div>
+    </div>
+    <div class="page" id="page-control">
+      <div class="page-header"><h1>Control</h1><p>Start, stop and configure the dryer</p></div>
+      <div class="section-title">Filament preset</div>
+      <div class="preset-grid" id="preset-grid"></div>
+      <div class="card">
+        <div class="section-title">Temperature</div>
+        <div class="ctrl-row"><span class="ctrl-label">Target</span><input type="range" id="c-temp" min="35" max="85" step="5" value="50" oninput="document.getElementById('c-temp-val').textContent=this.value+' C'"><span class="ctrl-val" id="c-temp-val">50 C</span></div>
+        <div class="section-title">Duration</div>
+        <div class="ctrl-row"><span class="ctrl-label">Hours</span><input type="range" id="c-hours" min="0.5" max="24" step="0.5" value="6" oninput="updateTimeDisplay()"><span class="ctrl-val" id="c-time-val">6:00</span></div>
+        <div class="btn-group"><button class="btn btn-primary" onclick="startDry()">Start drying</button><button class="btn btn-danger" onclick="stopDry()">Stop</button></div>
+      </div>
+      <div class="card"><div class="section-title">Fault reset</div><p style="font-size:13px;color:var(--muted);margin-bottom:12px">Reset available only after chamber cools below 50 C or 10 min after sensor fault.</p><button class="btn btn-accent" onclick="cmd('action=reset')">Reset fault</button></div>
+    </div>
+    <div class="page" id="page-history">
+      <div class="page-header"><h1>Session history</h1><p>Temperature and humidity over this session</p></div>
+      <div class="card"><canvas id="hist-canvas-2" style="width:100%;height:200px;display:block"></canvas></div>
+      <div class="card" style="margin-top:0">
+        <div class="section-title">Session stats</div>
+        <div class="grid-2">
+          <div><div class="card-label">Peak temp</div><div class="card-value sm hot" id="h-peak">--</div></div>
+          <div><div class="card-label">Min humidity</div><div class="card-value sm cool" id="h-minhum">--</div></div>
+          <div style="margin-top:12px"><div class="card-label">Start humidity</div><div class="card-value sm" id="h-starthum">--</div></div>
+          <div style="margin-top:12px"><div class="card-label">Samples</div><div class="card-value sm" id="h-samples">0</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="page" id="page-settings">
+      <div class="page-header"><h1>Settings</h1><p>Connection configuration</p></div>
+      <div class="card">
+        <div class="section-title">Dryer IP address</div>
+        <p style="font-size:13px;color:var(--muted);margin-bottom:12px">Enter the IP shown on the dryer Settings screen. Both devices must be on the same WiFi network.</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <input type="text" id="ip-input" placeholder="192.168.1.42" style="flex:1;min-width:160px;background:var(--card2);border:1px solid var(--border);color:var(--text);padding:10px 12px;border-radius:8px;font-size:14px">
+          <button class="btn btn-accent" onclick="saveIp()">Connect</button>
+        </div>
+        <div style="font-size:12px;color:var(--muted);margin-top:8px" id="ip-status">Not connected</div>
+      </div>
+      <div class="card">
+        <div class="section-title">Status</div>
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px"><span class="status-dot" id="settings-dot"></span><span id="settings-conn" style="font-size:14px">Disconnected</span></div>
+        <div class="card-label">Last update</div><div style="font-size:13px" id="last-update">never</div>
+      </div>
+      <div class="card">
+        <div class="section-title">About</div>
+        <div style="font-size:13px;color:var(--muted);line-height:1.8">SpacePi Dryer — Mod v01 Mike<br>Web app communicates with the ESP32 over local WiFi.<br>Safety limits are enforced on the device — this app cannot override them.<br>Source: github.com/mehregan59/Filament-dryer</div>
+      </div>
+    </div>
+  </main>
+</div>
+<script>
+const PRESETS=[{name:'PLA',temp:50,hours:6},{name:'PETG',temp:60,hours:6},{name:'ABS',temp:70,hours:8},{name:'ASA',temp:70,hours:8},{name:'PA/NY',temp:80,hours:12},{name:'PC',temp:85,hours:10}];
+let dryer={t:0,h:0,left:'--:--:--',heater:0,fan:0,state:'idle'},ip=localStorage.getItem('dryer_ip')||'',connected=false,pollTimer=null,animFrame2=0,fanAngle=0,histTemp=[],histHum=[],histTime=[],selPreset=0,sessionStart=null,totalMs=0;
+function nav(page,btn){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));document.getElementById('page-'+page).classList.add('active');btn.classList.add('active');if(page==='history')drawHistoryFull();}
+function saveIp(){const v=document.getElementById('ip-input').value.trim();if(!v)return toast('Enter an IP address');ip=v;localStorage.setItem('dryer_ip',ip);startPolling();}
+function startPolling(){if(pollTimer)clearInterval(pollTimer);if(!ip)return;poll();pollTimer=setInterval(poll,2000);}
+async function poll(){if(!ip)return;try{const r=await fetch('http://'+ip+'/api',{signal:AbortSignal.timeout(3000)});if(!r.ok)throw new Error();const d=await r.json();dryer=d;connected=true;onData();}catch(e){connected=false;setConn(false);}}
+async function cmd(q){if(!ip){toast('Not connected — enter IP in Settings');return;}try{const r=await fetch('http://'+ip+'/cmd?'+q,{signal:AbortSignal.timeout(4000)});const t=await r.text();if(!r.ok)toast(t);else{toast('Done');poll();}}catch(e){toast('Command failed');}}
+function onData(){setConn(true);const s=dryer.state,drying=s==='drying',fault=s.startsWith('E')||s.startsWith('e');document.getElementById('d-temp').textContent=(+dryer.t).toFixed(1);document.getElementById('d-hum').textContent=Math.round(+dryer.h);document.getElementById('d-timer').textContent=dryer.left;document.getElementById('dash-subtitle').textContent=drying?'Drying in progress':s==='finished'?'Drying complete':fault?'FAULT':'Idle';if(drying&&dryer.left!=='--:--:--'){const[h,m,sc]=dryer.left.split(':').map(Number),leftSec=h*3600+m*60+sc;if(!sessionStart){sessionStart=Date.now();totalMs=leftSec*1000;}const pct=totalMs>0?Math.min(100,(totalMs-leftSec*1000)/totalMs*100):0;document.getElementById('d-progress').style.width=pct.toFixed(1)+'%';document.getElementById('d-progress-label').textContent=pct.toFixed(0)+'% — '+dryer.left+' remaining';}else{sessionStart=null;document.getElementById('d-progress').style.width=s==='finished'?'100%':'0%';document.getElementById('d-progress-label').textContent=s;}
+const fp=document.getElementById('fault-panel');if(fault){fp.classList.add('visible');document.getElementById('fault-msg').textContent=s;}else fp.classList.remove('visible');
+setBadge('d-heater-badge',dryer.heater,dryer.heater?'heat':'off',dryer.heater?'HEATING':'HOLDING');setBadge('d-fan-badge',dryer.fan,dryer.fan?'on':'off',dryer.fan?'ON':'OFF');
+const now=new Date().toLocaleTimeString();histTemp.push(+dryer.t);histHum.push(+dryer.h);histTime.push(now);if(histTemp.length>600){histTemp.shift();histHum.shift();histTime.shift();}document.getElementById('h-samples').textContent=histTemp.length;document.getElementById('h-peak').textContent=Math.max(...histTemp).toFixed(1)+' C';document.getElementById('h-minhum').textContent=Math.min(...histHum).toFixed(0)+' %';if(!document.getElementById('h-starthum').dataset.set){document.getElementById('h-starthum').textContent=Math.round(+dryer.h)+' %';document.getElementById('h-starthum').dataset.set='1';}drawHistMini();document.getElementById('last-update').textContent=new Date().toLocaleTimeString();}
+function setBadge(id,isOn,cls,label){const el=document.getElementById(id);el.className='badge '+cls;el.innerHTML='<span class="badge-dot"></span>'+label;}
+function setConn(ok){['conn-dot','settings-dot'].forEach(id=>{document.getElementById(id).className='status-dot'+(ok?' on':'');});document.getElementById('conn-text').textContent=ok?'Connected · '+ip:'Disconnected';document.getElementById('settings-conn').textContent=ok?'Connected to '+ip:'Disconnected';document.getElementById('ip-status').textContent=ok?'Connected to '+ip:'Not connected';}
+function updateTimeDisplay(){const v=+document.getElementById('c-hours').value,h=Math.floor(v),m=v%1===0.5?'30':'00';document.getElementById('c-time-val').textContent=h+':'+m;}
+function startDry(){const temp=document.getElementById('c-temp').value,v=+document.getElementById('c-hours').value,mins=Math.round(v*60);cmd('action=start&preset='+selPreset+'&temp='+temp+'&min='+mins);}
+function stopDry(){cmd('action=stop');}
+function buildPresets(){const g=document.getElementById('preset-grid');g.innerHTML=PRESETS.map((p,i)=>'<button class="preset-btn'+(i===0?' active':'')+'" onclick="selectPreset('+i+')"><span class="preset-name">'+p.name+'</span>'+p.temp+' C · '+p.hours+'h</button>').join('');}
+function selectPreset(i){selPreset=i;document.querySelectorAll('.preset-btn').forEach((b,j)=>b.classList.toggle('active',j===i));document.getElementById('c-temp').value=PRESETS[i].temp;document.getElementById('c-temp-val').textContent=PRESETS[i].temp+' C';document.getElementById('c-hours').value=PRESETS[i].hours;updateTimeDisplay();}
+function drawChart(ctx,w,h,temps,hums){ctx.clearRect(0,0,w,h);if(temps.length<2){ctx.fillStyle='#3a4a6a';ctx.font='13px system-ui';ctx.textAlign='center';ctx.fillText('Waiting for data…',w/2,h/2);return;}const pad={l:36,r:12,t:10,b:24},cw=w-pad.l-pad.r,ch=h-pad.t-pad.b,tmax=Math.max(...temps,50),tmin=Math.min(...temps,20),tx=i=>pad.l+(i/(temps.length-1))*cw,ty=v=>pad.t+ch-((v-tmin)/(tmax-tmin+1))*ch,hy=v=>pad.t+ch-(v/100)*ch;ctx.strokeStyle='#1e2a42';ctx.lineWidth=0.5;for(let i=0;i<=4;i++){const y=pad.t+i*(ch/4);ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(w-pad.r,y);ctx.stroke();const tv=tmax-i*(tmax-tmin)/4;ctx.fillStyle='#4a6080';ctx.font='10px monospace';ctx.textAlign='right';ctx.fillText(tv.toFixed(0),pad.l-4,y+4);}ctx.strokeStyle='rgba(0,170,255,0.5)';ctx.lineWidth=1.5;ctx.beginPath();hums.forEach((v,i)=>i===0?ctx.moveTo(tx(i),hy(v)):ctx.lineTo(tx(i),hy(v)));ctx.stroke();ctx.strokeStyle='#f80';ctx.lineWidth=2;ctx.beginPath();temps.forEach((v,i)=>i===0?ctx.moveTo(tx(i),ty(v)):ctx.lineTo(tx(i),ty(v)));ctx.stroke();ctx.fillStyle='#f80';ctx.font='10px system-ui';ctx.textAlign='left';ctx.fillText('temp',pad.l,h-6);ctx.fillStyle='rgba(0,170,255,0.8)';ctx.fillText('hum%',pad.l+44,h-6);}
+function drawHistMini(){const c=document.getElementById('hist-canvas'),ctx=c.getContext('2d');c.width=c.offsetWidth;c.height=140;drawChart(ctx,c.width,140,histTemp.slice(-120),histHum.slice(-120));}
+function drawHistoryFull(){const c=document.getElementById('hist-canvas-2'),ctx=c.getContext('2d');c.width=c.offsetWidth;c.height=200;drawChart(ctx,c.width,200,histTemp,histHum);}
+function drawFlame(ctx,on){ctx.clearRect(0,0,50,60);if(on){const fl=animFrame2%5;ctx.fillStyle='#f80';ctx.beginPath();ctx.moveTo(25-13,56);ctx.quadraticCurveTo(5,36,25,16-fl);ctx.quadraticCurveTo(45,36,25+13,56);ctx.closePath();ctx.fill();ctx.fillStyle='#ffe040';ctx.beginPath();ctx.moveTo(25-7,56);ctx.quadraticCurveTo(15,42,25,30-fl);ctx.quadraticCurveTo(35,42,25+7,56);ctx.closePath();ctx.fill();}else{ctx.fillStyle='#1a3060';ctx.beginPath();ctx.ellipse(25,50,14,8,0,0,Math.PI*2);ctx.fill();ctx.fillStyle='#2244a0';ctx.beginPath();ctx.moveTo(17,50);ctx.lineTo(33,50);ctx.lineTo(25,28);ctx.closePath();ctx.fill();ctx.strokeStyle='#0af';ctx.lineWidth=1.5;[[11,40,39,40],[25,26,25,54],[15,31,35,49],[35,31,15,49]].forEach(([x1,y1,x2,y2])=>{ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();});}}
+function drawFanIcon(ctx,on){ctx.clearRect(0,0,50,50);const cx=25,cy=25;ctx.strokeStyle=on?'#0af':'#334';ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(cx,cy,20,0,Math.PI*2);ctx.stroke();for(let b=0;b<4;b++){const a=fanAngle+b*Math.PI/2;ctx.fillStyle=on?'#0af':'#2a3a50';ctx.beginPath();ctx.moveTo(cx+17*Math.cos(a),cy+17*Math.sin(a));ctx.lineTo(cx+7*Math.cos(a+0.6),cy+7*Math.sin(a+0.6));ctx.lineTo(cx+7*Math.cos(a-0.6),cy+7*Math.sin(a-0.6));ctx.closePath();ctx.fill();}ctx.fillStyle='#eee';ctx.beginPath();ctx.arc(cx,cy,4,0,Math.PI*2);ctx.fill();if(!on){ctx.strokeStyle='#e33';ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(15,15);ctx.lineTo(35,35);ctx.stroke();ctx.beginPath();ctx.moveTo(35,15);ctx.lineTo(15,35);ctx.stroke();}}
+function animLoop(){animFrame2++;if(dryer.fan)fanAngle+=0.1;drawFlame(document.getElementById('anim-flame').getContext('2d'),dryer.heater);drawFanIcon(document.getElementById('anim-fan').getContext('2d'),dryer.fan);requestAnimationFrame(animLoop);}
+function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500);}
+buildPresets();updateTimeDisplay();if(ip){document.getElementById('ip-input').value=ip;startPolling();}animLoop();
+</script>
+</body>
+</html>
