@@ -1,5 +1,5 @@
 /*
- * SpacePi Dryer — custom ESP32 controller — Mod v01 Mike (firmware v3 OTA)
+ * SpacePi Dryer — custom ESP32 controller — Mod v01 Mike (firmware v10 OTA — corrected display layouts)
  *
  * OTA: Tools->Port->spacepi-dryer, password: dryer2024
  * Board: Elecrow 3.5" ESP32-WROOM-32 HMI (ILI9488 480x320, resistive touch)
@@ -9,7 +9,9 @@
  *
  * v2: flicker-free draws (padding + sprites), flame + dual 4-blade fan
  * animation, gradient UI, run-screensaver, on-screen WiFi setup keyboard.
- * SAFETY LOGIC UNCHANGED AND ACTIVE IN ALL SCREENS INCLUDING SCREENSAVER.
+ * SAFETY: idle standby and active-cycle screensaver are separate states.
+ * v10: all four run layouts corrected; continuous animation removed to stop flicker.
+ * Heater control is impossible from standby.
  */
 
 #include <Wire.h>
@@ -29,8 +31,9 @@ const char* AP_PASS   = "dryer1234";
 const char* TZ_INFO   = "CET-1CEST,M3.5.0,M10.5.0/3";  // Germany
 const char* OTA_HOSTNAME = "spacepi-dryer";
 const char* OTA_PASSWORD = "dryer2024";
-#define TOUCH_THRESHOLD  145       // lower = more sensitive (was 300)
-#define IDLE_TIMEOUT_MS  30000UL   // home → idle clock after 30s no touch
+#define TOUCH_THRESHOLD  300       // reject resistive-panel noise; confirmed presses are debounced below
+#define ENABLE_IDLE_CLOCK 1         // 1 = show clock after timeout
+#define IDLE_TIMEOUT_MS  30000UL   // used only when ENABLE_IDLE_CLOCK is 1
 #define SAVER_TIMEOUT_MS 60000UL   // screensaver after 1 min untouched while drying
 
 // ================= DISPLAY / CONTROL TUNING =================
@@ -67,14 +70,21 @@ const int N_PRESETS = 6;
 
 // ================= STATE =================
 enum Screen { SCR_HOME, SCR_RUN, SCR_DONE, SCR_SETTINGS, SCR_FAULT,
-              SCR_SAVER, SCR_WIFI, SCR_KBD };
+              SCR_SAVER,       // screensaver while a real drying cycle is active
+              SCR_STANDBY,     // idle/home screensaver; NEVER runs heater control
+              SCR_WIFI, SCR_KBD };
 Screen screen = SCR_HOME;
 
 int   selPreset = 0, setTemp = 50, setHours = 6, setMinutes = 0;
 float curTemp = 0, curHum = 0;          // raw sensor values (control uses these)
 float dispTemp = 0, dispHum = 0;        // smoothed values shown on display
 bool  heaterOn = false, fanOn = false, sensorOk = false;
+bool  manualFanMode = false;          // true only when user selected FAN ONLY
 bool  saverEnabled = true;              // toggled in Settings, stored in prefs
+uint8_t mainTheme = 0;                    // 0..3, selectable on LCD/web
+uint8_t saverTheme = 0;                   // 0..3, selectable on LCD/web
+bool antiFlicker = true;                  // redraw complete frames only when needed
+uint8_t settingsPage = 0;                 // 0=appearance, 1=system
 
 // rolling temperature average
 float tempBuf[TEMP_AVG_SAMPLES];
@@ -221,6 +231,7 @@ void historyTrackRun() {
 }
 void drawFault();  // fwd
 void enterFault(const char* msg) {
+  manualFanMode = false;
   heaterWrite(false);
   fanWrite(true);
   faultAtMs = millis();
@@ -278,7 +289,7 @@ void readSensor() {
     // during drying: update every 3 min once we have been running > 3 min
     // before that and in all other modes: update immediately
     unsigned long now2 = millis();
-    bool drying = (screen == SCR_RUN || screen == SCR_SAVER);
+    bool drying = (screen == SCR_RUN || screen == SCR_SAVER);  // SCR_STANDBY is deliberately excluded
     unsigned long runningMs = (runStartMs > 0) ? (now2 - runStartMs) : 0;
     bool steadyDrying = drying && runningMs > HUM_UPDATE_MS;
     unsigned long humInterval = steadyDrying ? HUM_UPDATE_MS : 0UL;
@@ -297,7 +308,21 @@ void readSensor() {
 // ---------------------------------------------------------------
 void finishRun();  // fwd
 void controlLoop() {
-  if (screen != SCR_RUN) return;   // saver no longer used during drying
+  // Root-cause fix: display state and machine state are separate.
+  // Only SCR_RUN and SCR_SAVER belong to a real cycle. SCR_STANDBY can never
+  // enter this control path, so selecting an idle screensaver cannot start outputs.
+  if (screen != SCR_RUN && screen != SCR_SAVER) return;
+
+  // A valid cycle must have both timestamps. This also protects against an
+  // incomplete OTA/reboot state being interpreted as a finished or active run.
+  if (runStartMs == 0 || runEndMs == 0) {
+    heaterWrite(false);
+    if (!manualFanMode && (!sensorOk || curTemp <= COOLDOWN_TEMP)) fanWrite(false);
+    screen = SCR_HOME;
+    drawHome();
+    return;
+  }
+
   if (sensorOk && curTemp >= MAX_TEMP_C) { enterFault("E2 over temperature"); return; }
   if ((long)(millis() - runEndMs) >= 0)  { finishRun(); return; }
   if (!sensorOk) return;
@@ -629,29 +654,58 @@ void drawHomeLive() {
   tft.drawString(v, 22, 250, 2);
   tft.setTextPadding(0);
 }
-void drawHome() {
-  idleMode = false;   // full home screen disables idle overlay
-  newScreen("SpacePi Dryer");
+void drawHomeThemeHeader(const char* title) {
+  newScreen(title);
+  // compact live status in header, common to all four styles
+  char live[32];
+  if (sensorOk) snprintf(live, sizeof(live), "%.1fC  %.0f%%", dispTemp, dispHum);
+  else snprintf(live, sizeof(live), "sensor --");
+  tft.setTextColor(sensorOk ? C_ACCENT : C_BAD, C_HDR);
+  tft.setTextDatum(MR_DATUM); tft.setTextPadding(150);
+  tft.drawString(live, 468, 18, 2); tft.setTextPadding(0);
+}
+
+void drawHomeControlsCommon() {
+  // Presets and all original controls remain in the same touch zones.
   drawPresets();
-  tft.setTextColor(C_MUTED, C_HDR);  // labels sit on gradient; draw with own bg patches
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(C_MUTED, C_BG);
-  // temp adjuster
   btn(12, 182, 56, 48, "-", C_CARD);
   tft.fillRoundRect(74, 182, 90, 48, 8, C_CARD);
   btn(170, 182, 56, 48, "+", C_CARD);
-  drawTempVal();
-  // time adjuster
   btn(254, 182, 56, 48, "-", C_CARD);
   tft.fillRoundRect(316, 182, 90, 48, 8, C_CARD);
   btn(412, 182, 56, 48, "+", C_CARD);
-  drawTimeVal();
-  // live readout card + start + settings
+  drawTempVal(); drawTimeVal();
   tft.fillRoundRect(12, 238, 170, 24, 8, C_CARD);
   drawHomeLive();
-  btn(12,  270, 230, 44, "START DRYING", C_GOOD, 0x0000);
-  btn(250, 270, 110, 44, fanOn ? "FAN OFF" : "FAN ONLY", fanOn ? C_ACCENT : C_CARD, fanOn ? 0x0000 : C_TEXT);
+  btn(12, 270, 230, 44, "START DRYING", C_GOOD, 0x0000);
+  const char* fanLabel = manualFanMode ? "FAN OFF" : (fanOn ? "COOLING" : "FAN ONLY");
+  btn(250, 270, 110, 44, fanLabel, fanOn ? C_ACCENT : C_CARD, fanOn ? 0x0000 : C_TEXT);
   btn(368, 270, 100, 44, "Setup", C_CARD);
+}
+
+void drawHome() {
+  idleMode = false;
+  switch (mainTheme % 4) {
+    case 0: // Modern cards
+      drawHomeThemeHeader("SpacePi Dryer");
+      drawHomeControlsCommon();
+      break;
+    case 1: // Circular accents behind preset cards
+      drawHomeThemeHeader("Circular Control");
+      tft.drawCircle(82, 96, 47, 0x047F); tft.drawCircle(398, 96, 47, C_HOT);
+      drawHomeControlsCommon();
+      break;
+    case 2: // Minimal industrial
+      drawHomeThemeHeader("Dryer Control");
+      tft.drawFastHLine(12, 174, 456, 0x2945);
+      drawHomeControlsCommon();
+      break;
+    default: // Split-panel
+      drawHomeThemeHeader("Live Dashboard");
+      tft.fillRoundRect(8, 40, 464, 112, 12, 0x1108);
+      drawHomeControlsCommon();
+      break;
+  }
 }
 void startRun();  // fwd
 void drawSettings();
@@ -676,14 +730,16 @@ void touchHome(int tx, int ty) {
   }
   if (hit(tx, ty, 12,  270, 230, 44)) startRun();
   if (hit(tx, ty, 250, 270, 110, 44)) {
-    // fan only — toggle fan without heating
-    if (fanOn) {
-      fanWrite(false);
-    } else {
+    // Manual FAN ONLY mode. Automatic cooling cannot be switched off while hot.
+    if (manualFanMode) {
+      manualFanMode = false;
+      if (!sensorOk || curTemp <= COOLDOWN_TEMP) fanWrite(false);
+    } else if (!(fanOn && sensorOk && curTemp > COOLDOWN_TEMP)) {
+      manualFanMode = true;
       fanWrite(true);
     }
-    // redraw just the fan button
-    btn(250, 270, 110, 44, fanOn ? "FAN OFF" : "FAN ONLY", fanOn ? C_ACCENT : C_CARD, fanOn ? 0x0000 : C_TEXT);
+    const char* fanLabel = manualFanMode ? "FAN OFF" : (fanOn ? "COOLING" : "FAN ONLY");
+    btn(250, 270, 110, 44, fanLabel, fanOn ? C_ACCENT : C_CARD, fanOn ? 0x0000 : C_TEXT);
   }
   if (hit(tx, ty, 368, 270, 100, 44)) { screen = SCR_SETTINGS; drawSettings(); }
 }
@@ -691,70 +747,204 @@ void touchHome(int tx, int ty) {
 // ---------------------------------------------------------------
 //                      RUN SCREEN
 // ---------------------------------------------------------------
+uint32_t runUiGeneration = 0;
+
 void drawRunStatic() {
-  char t[32]; snprintf(t, sizeof(t), "%s  ->  %d C", presets[selPreset].name, setTemp);
-  newScreen(t);
-  tft.fillRoundRect(12,  44, 220, 104, 10, C_CARD);   // temp card
-  tft.fillRoundRect(248, 44, 220, 104, 10, C_CARD);   // humidity card
-  tft.fillRoundRect(12, 158, 456,  56, 10, C_CARD);   // timer card
-  // status badge area (heater left, fan right) — redrawn dynamically
-  tft.fillRoundRect(12,  228, 220, 28, 8, C_CARD);
-  tft.fillRoundRect(248, 228, 220, 28, 8, C_CARD);
-  btn(368, 262, 100, 50, "STOP", C_BAD);
+  char title[32];
+  snprintf(title, sizeof(title), "%s  target %d C", presets[selPreset].name, setTemp);
+  newScreen(title);
+  runUiGeneration++;   // forces every dynamic field to be drawn once for the new layout
+
+  switch (mainTheme % 4) {
+    case 0: // Modern Cards
+      tft.fillRoundRect(12,44,220,104,12,C_CARD);
+      tft.fillRoundRect(248,44,220,104,12,C_CARD);
+      tft.fillRoundRect(12,158,456,60,12,C_CARD);
+      tft.setTextColor(C_MUTED,C_CARD); tft.setTextDatum(MC_DATUM);
+      tft.drawString("TEMPERATURE",122,58,2);
+      tft.drawString("HUMIDITY",358,58,2);
+      tft.drawString("TIME REMAINING",240,168,2);
+      break;
+
+    case 1: // Circular Dial — no redundant heater bars
+      tft.fillRoundRect(12,72,112,104,12,C_CARD);
+      tft.fillRoundRect(356,72,112,104,12,C_CARD);
+      tft.fillCircle(240,145,80,C_BG);
+      tft.drawCircle(240,145,91,0x047F);
+      tft.drawCircle(240,145,82,0x025F);
+      tft.drawArc(240,145,91,86,210,330,C_ACCENT,C_BG);
+      tft.drawArc(240,145,91,86,30,145,C_HOT,C_BG);
+      tft.setTextColor(C_MUTED,C_CARD); tft.setTextDatum(MC_DATUM);
+      tft.drawString("TEMP",68,92,2);
+      tft.drawString("HUMIDITY",412,92,2);
+      tft.setTextColor(C_MUTED,C_BG);
+      tft.drawString("TIME REMAINING",240,105,2);
+      break;
+
+    case 2: // Minimal Industrial
+      tft.fillRoundRect(12,74,456,142,12,0x080F);
+      tft.drawFastHLine(14,72,452,0x2945);
+      tft.drawFastHLine(14,218,452,0x2945);
+      tft.setTextDatum(TL_DATUM); tft.setTextColor(C_MUTED,C_BG);
+      tft.drawString("TEMPERATURE",18,80,2);
+      tft.setTextDatum(TR_DATUM);
+      tft.drawString("HUMIDITY",462,80,2);
+      tft.setTextDatum(MC_DATUM);
+      tft.drawString("TIME REMAINING",240,124,2);
+      break;
+
+    default: // Split Dashboard
+      tft.fillRoundRect(12,44,220,82,12,C_CARD);
+      tft.fillRoundRect(248,44,220,82,12,C_CARD);
+      tft.fillRoundRect(12,136,456,82,12,0x1108);
+      tft.setTextDatum(MC_DATUM); tft.setTextColor(C_MUTED,C_CARD);
+      tft.drawString("TEMPERATURE",122,58,2);
+      tft.drawString("HUMIDITY",358,58,2);
+      tft.setTextColor(C_MUTED,0x1108);
+      tft.drawString("TIME REMAINING",240,150,2);
+      break;
+  }
+
+  // Stable bottom controls. Do not redraw heater state here: thermostat cycling
+  // caused the visible orange-bar flashing in the previous layouts.
+  tft.fillRoundRect(12,228,338,28,8,C_CARD);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(C_MUTED,C_CARD);
+  char info[48];
+  snprintf(info,sizeof(info),"Target %d C   Fan %s",setTemp,fanOn ? "ON" : "OFF");
+  tft.drawString(info,181,242,2);
+  btn(368,262,100,50,"STOP",C_BAD);
+  tft.setTextDatum(TL_DATUM);
 }
 
-void drawStatusBadges() {
-  static bool lastHeaterOn = !heaterOn;   // force draw on first call
-  static bool lastFanOn    = !fanOn;
-
-  if (heaterOn != lastHeaterOn) {
-    lastHeaterOn = heaterOn;
-    uint16_t hbg = heaterOn ? C_HOT  : C_CARD;
-    uint16_t hfg = heaterOn ? 0x0000 : C_MUTED;
-    tft.fillRoundRect(12, 228, 220, 28, 8, hbg);
-    tft.setTextColor(hfg, hbg); tft.setTextDatum(MC_DATUM);
-    tft.drawString(heaterOn ? "~ HEATING ~" : "-- HOLDING --", 122, 242, 2);
-  }
-
-  if (fanOn != lastFanOn) {
-    lastFanOn = fanOn;
-    uint16_t fbg = fanOn ? C_ACCENT : C_CARD;
-    uint16_t ffg = fanOn ? 0x0000   : C_MUTED;
-    tft.fillRoundRect(248, 228, 220, 28, 8, fbg);
-    tft.setTextColor(ffg, fbg); tft.setTextDatum(MC_DATUM);
-    tft.drawString(fanOn ? "* FAN ON *" : "-- FAN OFF --", 358, 242, 2);
-  }
-
+void drawStatusBadges(bool force = false) {
+  static bool lastFan = false;
+  static uint32_t lastGeneration = 0;
+  if (!force && lastGeneration == runUiGeneration && lastFan == fanOn) return;
+  lastGeneration = runUiGeneration;
+  lastFan = fanOn;
+  tft.fillRoundRect(12,228,338,28,8,C_CARD);
+  char info[48];
+  snprintf(info,sizeof(info),"Target %d C   Fan %s",setTemp,fanOn ? "ON" : "OFF");
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(C_MUTED,C_CARD);
+  tft.setTextPadding(322);
+  tft.drawString(info,181,242,2);
+  tft.setTextPadding(0);
   tft.setTextDatum(TL_DATUM);
 }
 
 void drawRunDynamic() {
-  // DEBUG — remove after confirming fix
-  Serial.printf("drawRunDynamic: sensorOk=%d dispTemp=%.1f dispHum=%.1f curTemp=%.1f curHum=%.1f\n",
-                sensorOk, dispTemp, dispHum, curTemp, curHum);
+  char temp[18], hum[18], tl[18];
+  snprintf(temp,sizeof(temp),"%.1f C",dispTemp);
+  snprintf(hum,sizeof(hum),"%.0f %%RH",dispHum);
+  fmtTimeLeft(tl,sizeof(tl));
+  unsigned long total = max(1UL, runEndMs - runStartMs);
+  int progress = (int)(100.0f * min(1.0f,(float)(millis()-runStartMs)/(float)total));
 
-  char v[16];
-  snprintf(v, sizeof(v), "%.1f C", dispTemp);
-  tft.setTextColor(C_HOT, C_CARD); tft.setTextDatum(MC_DATUM);
-  tft.setTextPadding(190);
-  Serial.printf("  Drawing temp '%s' at x=122 y=88 color=0x%04X bg=0x%04X\n", v, (unsigned)C_HOT, (unsigned)C_CARD);
-  tft.drawString(v, 122, 88, 6);
-  tft.setTextColor(C_MUTED, C_CARD); tft.setTextPadding(0);
-  tft.drawString("temperature", 122, 130, 2);
-  snprintf(v, sizeof(v), "%.0f %%", dispHum);
-  tft.setTextColor(C_ACCENT, C_CARD); tft.setTextPadding(190);
-  tft.drawString(v, 358, 88, 6);
-  tft.setTextColor(C_MUTED, C_CARD); tft.setTextPadding(0);
-  tft.drawString("humidity", 358, 130, 2);
-  char tl[16]; fmtTimeLeft(tl, sizeof(tl));
-  tft.setTextColor(C_TEXT, C_CARD); tft.setTextPadding(250);
-  tft.drawString(tl, 240, 184, 6);
-  tft.setTextPadding(0);
-  unsigned long total = runEndMs - runStartMs;
-  int w = (int)(448.0f * min(1.0f, (float)(millis() - runStartMs) / (float)total));
-  tft.fillRect(16, 220, 448, 4, C_CARD);
-  tft.fillRect(16, 220, w, 4, C_GOOD);
-  drawStatusBadges();
+  static char oldTemp[18] = "";
+  static char oldHum[18] = "";
+  static char oldTl[18] = "";
+  static int oldProgress = -1;
+  static uint8_t oldTheme = 255;
+  static uint32_t oldGeneration = 0;
+
+  bool force = oldGeneration != runUiGeneration || oldTheme != (mainTheme % 4);
+  bool tempChanged = force || strcmp(oldTemp,temp) != 0;
+  bool humChanged = force || strcmp(oldHum,hum) != 0;
+  bool timeChanged = force || strcmp(oldTl,tl) != 0;
+  bool progressChanged = force || oldProgress != progress;
+
+  oldGeneration = runUiGeneration;
+  oldTheme = mainTheme % 4;
+  strcpy(oldTemp,temp); strcpy(oldHum,hum); strcpy(oldTl,tl);
+  oldProgress = progress;
+
+  tft.setTextDatum(MC_DATUM);
+  switch (mainTheme % 4) {
+    case 0: // Modern Cards
+      if (tempChanged) {
+        tft.setTextColor(C_HOT,C_CARD); tft.setTextPadding(190);
+        tft.drawString(temp,122,100,5); tft.setTextPadding(0);
+      }
+      if (humChanged) {
+        tft.setTextColor(C_ACCENT,C_CARD); tft.setTextPadding(190);
+        tft.drawString(hum,358,100,5); tft.setTextPadding(0);
+      }
+      if (timeChanged) {
+        tft.setTextColor(C_TEXT,C_CARD); tft.setTextPadding(300);
+        tft.drawString(tl,240,194,5); tft.setTextPadding(0);
+      }
+      if (progressChanged) {
+        tft.fillRect(18,210,444,5,0x2945);
+        tft.fillRect(18,210,444*progress/100,5,C_ACCENT);
+      }
+      break;
+
+    case 1: // Circular Dial
+      if (tempChanged) {
+        tft.setTextColor(C_HOT,C_CARD); tft.setTextPadding(96);
+        tft.drawString(temp,68,132,4); tft.setTextPadding(0);
+      }
+      if (humChanged) {
+        tft.setTextColor(C_ACCENT,C_CARD); tft.setTextPadding(96);
+        tft.drawString(hum,412,132,4); tft.setTextPadding(0);
+      }
+      if (timeChanged) {
+        // Font 4 is deliberately used: font 5 was too wide and could disappear.
+        tft.setTextColor(C_TEXT,C_BG); tft.setTextPadding(166);
+        tft.drawString(tl,240,148,4); tft.setTextPadding(0);
+      }
+      if (progressChanged) {
+        char pc[12]; snprintf(pc,sizeof(pc),"%d %%",progress);
+        tft.setTextColor(C_MUTED,C_BG); tft.setTextPadding(90);
+        tft.drawString(pc,240,184,2); tft.setTextPadding(0);
+      }
+      break;
+
+    case 2: // Minimal Industrial
+      if (tempChanged) {
+        tft.setTextColor(C_HOT,0x080F); tft.setTextDatum(TL_DATUM);
+        tft.setTextPadding(190); tft.drawString(temp,18,98,4); tft.setTextPadding(0);
+      }
+      if (humChanged) {
+        tft.setTextColor(C_ACCENT,0x080F); tft.setTextDatum(TR_DATUM);
+        tft.setTextPadding(190); tft.drawString(hum,462,98,4); tft.setTextPadding(0);
+      }
+      tft.setTextDatum(MC_DATUM);
+      if (timeChanged) {
+        // Use a supported, fitting font so the countdown is always visible.
+        tft.setTextColor(C_TEXT,0x080F); tft.setTextPadding(330);
+        tft.drawString(tl,240,170,6); tft.setTextPadding(0);
+      }
+      if (progressChanged) {
+        tft.fillRect(18,206,444,7,0x2945);
+        tft.fillRect(18,206,444*progress/100,7,C_ACCENT);
+      }
+      break;
+
+    default: // Split Dashboard
+      if (tempChanged) {
+        tft.setTextDatum(MC_DATUM); tft.setTextColor(C_HOT,C_CARD);
+        tft.setTextPadding(190); tft.drawString(temp,122,92,4); tft.setTextPadding(0);
+      }
+      if (humChanged) {
+        tft.setTextDatum(MC_DATUM); tft.setTextColor(C_ACCENT,C_CARD);
+        tft.setTextPadding(190); tft.drawString(hum,358,92,4); tft.setTextPadding(0);
+      }
+      if (timeChanged) {
+        tft.setTextDatum(MC_DATUM); tft.setTextColor(C_TEXT,0x1108);
+        tft.setTextPadding(310); tft.drawString(tl,240,181,5); tft.setTextPadding(0);
+      }
+      if (progressChanged) {
+        tft.fillRect(24,205,432,5,0x2945);
+        tft.fillRect(24,205,432*progress/100,5,C_ACCENT);
+      }
+      break;
+  }
+
+  tft.setTextDatum(TL_DATUM);
+  drawStatusBadges(force);
 }
 
 // animation strip: two 4-blade fans + flame, sprite = no flicker
@@ -834,182 +1024,95 @@ void touchRun(int tx, int ty) {
 // ---------------------------------------------------------------
 //                      SCREENSAVER — matches user sketch
 // ---------------------------------------------------------------
-void enterSaver() {
-  // snapshot current readings immediately into dedicated saver variables
+void enterSaver(bool fromHome = false) {
   if (sensorOk) {
-    saverTemp    = curTemp;
-    saverHum     = curHum;
+    saverTemp = curTemp;
+    saverHum = curHum;
     saverHasData = true;
+    dispTemp = curTemp;
+    dispHum = curHum;
   }
-  // also keep main display values in sync
-  if (sensorOk) { dispTemp = curTemp; dispHum = curHum; }
   lastHumUpdateMs = millis();
-  screen = SCR_SAVER;
-  tft.fillScreen(TFT_BLACK);
+  screen = fromHome ? SCR_STANDBY : SCR_SAVER;
   drawSaver();
 }
 
-void drawSaverAnimations() {
-  // Full 480x320 sprite — redrawn every frame, nothing can overwrite it
-  // This is the definitive fix: temp/hum live inside this sprite so they
-  // are guaranteed to appear every 120ms regardless of any other draw order.
+void drawSaverFrame() {
+  // Draw into one full-screen sprite and push once. No per-digit overdraw,
+  // therefore no ghost fragments. In anti-flicker mode this runs only once/second.
   sanim.fillSprite(TFT_BLACK);
-
-  // --- TOP: clock + WiFi ---
-  sanim.setTextColor(C_ACCENT, TFT_BLACK);
   sanim.setTextDatum(MC_DATUM);
-  sanim.setTextPadding(320);
-  sanim.drawString(clockStr, 230, 18, 4);
-  sanim.setTextPadding(0);
-  sanim.fillRoundRect(448, 6, 22, 14, 4, wifiUp ? C_GOOD : 0x3186);
+  char tl[16];
+  if (screen == SCR_STANDBY) strcpy(tl, "STANDBY"); else fmtTimeLeft(tl, sizeof(tl));
+  char temp[16], hum[16];
+  if (sensorOk) { snprintf(temp,sizeof(temp),"%.1f C",curTemp); snprintf(hum,sizeof(hum),"%.0f %%RH",curHum); }
+  else { strcpy(temp,"--.- C"); strcpy(hum,"-- %RH"); }
 
-  // --- CENTER: Temp left | Hum right — always from curTemp/curHum ---
-  char v[20];
-  snprintf(v, sizeof(v), "%.1f", curTemp);
-  sanim.setTextColor(C_HOT, TFT_BLACK);
-  sanim.setTextPadding(190);
-  sanim.setTextDatum(MC_DATUM);
-  sanim.drawString(v, 110, 90, 6);
-  sanim.setTextPadding(0);
-  sanim.setTextColor(C_MUTED, TFT_BLACK);
-  sanim.drawString("C", 110, 138, 2);
-
-  snprintf(v, sizeof(v), "%.0f", curHum);
-  sanim.setTextColor(C_ACCENT, TFT_BLACK);
-  sanim.setTextPadding(190);
-  sanim.drawString(v, 350, 90, 6);
-  sanim.setTextPadding(0);
-  sanim.setTextColor(C_MUTED, TFT_BLACK);
-  sanim.drawString("%", 350, 138, 2);
-
-  // vertical divider
-  sanim.drawFastVLine(240, 50, 110, 0x2945);
-
-  // --- TIMER button ---
-  char tl[16]; fmtTimeLeft(tl, sizeof(tl));
-  sanim.fillRoundRect(80, 155, 320, 48, 10, C_CARD);
-  sanim.setTextColor(C_TEXT, C_CARD);
-  sanim.setTextPadding(300);
-  sanim.drawString(tl, 240, 179, 4);
-  sanim.setTextPadding(0);
-
-  // --- HEATER animation (bottom-left) ---
-  int hx = 100, hy = 270;
-  if (heaterOn) {
-    int fl = animFrame % 5;
-    sanim.fillTriangle(hx-16, hy+26, hx+16, hy+26, hx,    hy-14-fl, C_HOT);
-    sanim.fillEllipse(hx, hy+14, 16, 14, C_HOT);
-    sanim.fillTriangle(hx-8,  hy+26, hx+8,  hy+26, hx,    hy-fl,    C_FLAME_Y);
-    sanim.fillEllipse(hx, hy+16, 9, 9, C_FLAME_Y);
-    if (animFrame % 2 == 0)
-      sanim.fillTriangle(hx-3, hy+6, hx+3, hy+6, hx, hy-20-fl, C_TEXT);
-    sanim.setTextColor(C_HOT, TFT_BLACK);
-  } else {
-    sanim.fillEllipse(hx, hy+14, 14, 8, 0x001F);
-    sanim.fillTriangle(hx-8, hy+14, hx+8, hy+14, hx, hy-8, 0x033F);
-    sanim.drawLine(hx-14, hy, hx+14, hy, 0x05FF);
-    sanim.drawLine(hx, hy-8, hx, hy+14, 0x05FF);
-    sanim.drawLine(hx-10, hy-4, hx+10, hy+10, 0x05FF);
-    sanim.drawLine(hx+10, hy-4, hx-10, hy+10, 0x05FF);
-    sanim.setTextColor(0x05FF, TFT_BLACK);
-  }
-  sanim.setTextDatum(MC_DATUM);
-  sanim.drawString(heaterOn ? "HEAT" : "COLD", hx, hy+34, 2);
-
-  // --- FAN animation (bottom-right) ---
-  int fx = 370, fy = 272;
-  sanim.drawCircle(fx, fy, 28, fanOn ? C_ACCENT : C_MUTED);
-  if (fanOn) {
-    float a0 = animFrame * 0.5f;
-    for (int b = 0; b < 4; b++) {
-      float a = a0 + b * 1.5708f;
-      sanim.fillTriangle(fx+(int)(22*cosf(a)),       fy+(int)(22*sinf(a)),
-                         fx+(int)(9 *cosf(a+0.6f)),  fy+(int)(9 *sinf(a+0.6f)),
-                         fx+(int)(9 *cosf(a-0.6f)),  fy+(int)(9 *sinf(a-0.6f)), C_ACCENT);
+  switch (saverTheme % 4) {
+    case 0: { // Minimal Glow
+      sanim.setTextColor(C_MUTED,TFT_BLACK); sanim.drawString(screen == SCR_STANDBY ? "STANDBY" : "DRYING",240,34,2);
+      sanim.setTextColor(C_ACCENT,TFT_BLACK); sanim.drawString(clockStr,240,112,7);
+      sanim.setTextColor(C_HOT,TFT_BLACK); sanim.drawString(temp,90,22,2);
+      sanim.setTextColor(C_ACCENT,TFT_BLACK); sanim.drawString(hum,390,22,2);
+      sanim.drawFastHLine(90,180,300,0x18C5);
+      sanim.setTextColor(C_MUTED,TFT_BLACK); sanim.drawString("touch to wake",240,292,2);
+      break;
     }
-    sanim.fillCircle(fx, fy, 5, C_TEXT);
-    sanim.setTextColor(C_ACCENT, TFT_BLACK);
-  } else {
-    for (int b = 0; b < 4; b++) {
-      float a = 0.4f + b * 1.5708f;
-      sanim.fillTriangle(fx+(int)(22*cosf(a)),       fy+(int)(22*sinf(a)),
-                         fx+(int)(9 *cosf(a+0.6f)),  fy+(int)(9 *sinf(a+0.6f)),
-                         fx+(int)(9 *cosf(a-0.6f)),  fy+(int)(9 *sinf(a-0.6f)), C_MUTED);
+    case 1: { // Data Cards
+      sanim.fillRoundRect(18,18,210,82,12,C_CARD); sanim.fillRoundRect(252,18,210,82,12,C_CARD);
+      sanim.setTextColor(C_MUTED,C_CARD); sanim.drawString("TEMPERATURE",123,38,2); sanim.drawString("HUMIDITY",357,38,2);
+      sanim.setTextColor(C_HOT,C_CARD); sanim.drawString(temp,123,72,4);
+      sanim.setTextColor(C_ACCENT,C_CARD); sanim.drawString(hum,357,72,4);
+      sanim.setTextColor(C_ACCENT,TFT_BLACK); sanim.drawString(clockStr,240,150,7);
+      sanim.setTextColor(C_TEXT,TFT_BLACK); sanim.drawString(tl,240,218,4);
+      sanim.fillRoundRect(75,252,330,36,10,C_CARD);
+      sanim.setTextColor(C_MUTED,C_CARD); sanim.drawString(screen == SCR_STANDBY ? "Standby   heater " : "Drying   heater ",180,270,2);
+      sanim.setTextColor(heaterOn?C_HOT:C_MUTED,C_CARD); sanim.drawString(heaterOn?"ON":"OFF",285,270,2);
+      sanim.setTextColor(fanOn?C_ACCENT:C_MUTED,C_CARD); sanim.drawString(fanOn?"fan ON":"fan OFF",355,270,2);
+      break;
     }
-    sanim.fillCircle(fx, fy, 5, 0x6B4D);
-    sanim.drawLine(fx-10, fy-10, fx+10, fy+10, C_BAD);
-    sanim.drawLine(fx+10, fy-10, fx-10, fy+10, C_BAD);
-    sanim.setTextColor(C_MUTED, TFT_BLACK);
+    case 2: { // Orbit Dial
+      int cx=240,cy=155;
+      sanim.drawCircle(cx,cy,105,0x047F); sanim.drawCircle(cx,cy,96,0x025F);
+      sanim.drawArc(cx,cy,105,99,210,330,C_ACCENT,TFT_BLACK);
+      sanim.drawArc(cx,cy,105,99,30,145,C_HOT,TFT_BLACK);
+      sanim.setTextColor(C_MUTED,TFT_BLACK); sanim.drawString(screen == SCR_STANDBY ? "IDLE" : "DRYING",cx,92,2);
+      sanim.setTextColor(C_TEXT,TFT_BLACK); sanim.drawString(clockStr,cx,145,6);
+      sanim.setTextColor(C_HOT,TFT_BLACK); sanim.drawString(temp,78,155,3);
+      sanim.setTextColor(C_ACCENT,TFT_BLACK); sanim.drawString(hum,402,155,3);
+      sanim.setTextColor(C_MUTED,TFT_BLACK); sanim.drawString("touch to wake",cx,286,2);
+      break;
+    }
+    default: { // Modern Flip, static cards (no flip animation = no ghosting)
+      sanim.setTextColor(C_HOT,TFT_BLACK); sanim.drawString(temp,90,28,2);
+      sanim.setTextColor(C_ACCENT,TFT_BLACK); sanim.drawString(hum,390,28,2);
+      const int x[4]={55,155,275,375};
+      char digits[5]="0000"; int di=0;
+      for (int i=0; clockStr[i] && di<4; i++) if (clockStr[i]>='0'&&clockStr[i]<='9') digits[di++]=clockStr[i];
+      for(int i=0;i<4;i++) { sanim.fillRoundRect(x[i]-42,72,84,126,10,C_CARD); sanim.drawFastHLine(x[i]-40,135,80,0x3148); char z[2]={digits[i],0}; sanim.setTextColor(C_ACCENT,C_CARD); sanim.drawString(z,x[i],135,7); }
+      sanim.fillCircle(240,115,5,C_TEXT); sanim.fillCircle(240,155,5,C_TEXT);
+      sanim.setTextColor(C_TEXT,TFT_BLACK); sanim.drawString(tl,240,230,4);
+      sanim.setTextColor(C_MUTED,TFT_BLACK); sanim.drawString("touch to wake",240,292,2);
+      break;
+    }
   }
-  sanim.setTextDatum(MC_DATUM);
-  sanim.drawString("FAN", fx, fy+34, 2);
-
-  // hint
-  sanim.setTextColor(0x1A2A3A, TFT_BLACK);
-  sanim.drawString("touch to return", 240, 312, 2);
-
-  sanim.pushSprite(0, 0);   // full screen push — covers everything cleanly
+  sanim.fillRoundRect(452,8,16,12,3,wifiUp?C_GOOD:C_MUTED);
+  sanim.pushSprite(0,0);
 }
-
-void drawSaver() {
-  // --- TOP: date time + WiFi dot ---
-  tft.setTextColor(C_ACCENT, TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextPadding(320);
-  tft.drawString(clockStr, 230, 18, 4);
-  tft.setTextPadding(0);
-  // WiFi indicator dot top-right
-  tft.fillRect(448, 8, 14, 14, TFT_BLACK);
-  tft.fillRoundRect(448, 8, 14, 14, 3, wifiUp ? C_GOOD : C_MUTED);
-
-  // --- CENTER: Temp left | Hum right ---
-  // Use saverTemp/saverHum — updated every 1s from readSensor, never 0.0
-  char v[20];
-  if (saverHasData) {
-    snprintf(v, sizeof(v), "%.1f", saverTemp);
-    tft.setTextColor(C_HOT, TFT_BLACK);
-    tft.setTextPadding(190);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString(v, 110, 90, 6);
-    tft.setTextPadding(0);
-    tft.setTextColor(C_MUTED, TFT_BLACK);
-    tft.drawString("C", 110, 138, 2);
-
-    snprintf(v, sizeof(v), "%.0f", saverHum);
-    tft.setTextColor(C_ACCENT, TFT_BLACK);
-    tft.setTextPadding(190);
-    tft.drawString(v, 350, 90, 6);
-    tft.setTextPadding(0);
-    tft.setTextColor(C_MUTED, TFT_BLACK);
-    tft.drawString("%", 350, 138, 2);
-  } else {
-    tft.setTextColor(C_MUTED, TFT_BLACK);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString("--", 110, 90, 6);
-    tft.drawString("--", 350, 90, 6);
-  }
-
-  // divider
-  tft.drawFastVLine(240, 50, 110, 0x2945);
-
-  // --- TIMER BUTTON center --- (y=155, height=48 → bottom=203, safely above animation at y=220)
-  char tl[16]; fmtTimeLeft(tl, sizeof(tl));
-  tft.fillRoundRect(80, 155, 320, 48, 10, C_CARD);
-  tft.setTextColor(C_TEXT, C_CARD);
-  tft.setTextPadding(300);
-  tft.drawString(tl, 240, 179, 4);
-  tft.setTextPadding(0);
-
-  // hint at very bottom (below animation sprite at y=220+90=310)
-  tft.setTextColor(0x1A2A3A, TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.drawString("touch anywhere to return", 240, 312, 2);
-}
+void drawSaverAnimations() { drawSaverFrame(); }
+void drawSaver() { drawSaverFrame(); }
 void exitSaver() {
-  screen = SCR_RUN;
-  tft.fillScreen(TFT_BLACK);  // clear saver
-  drawRunStatic();
-  drawRunDynamic();
+  bool wasStandby = (screen == SCR_STANDBY);
+  tft.fillScreen(TFT_BLACK);
+  if (wasStandby) {
+    screen = SCR_HOME;
+    drawHome();
+  } else {
+    screen = SCR_RUN;
+    drawRunStatic();
+    drawRunDynamic();
+  }
+  lastTouchMs = millis();
 }
 
 // ---------------------------------------------------------------
@@ -1040,6 +1143,7 @@ void drawDoneAnim() {
   tft.setTextPadding(0);
 }
 void finishRun() {
+  manualFanMode = false;
   heaterWrite(false);
   historySaveRun(0);   // outcome 0 = completed
   runStartMs = 0;
@@ -1048,6 +1152,7 @@ void finishRun() {
 }
 void touchDone(int tx, int ty) {
   if (hit(tx, ty, 140, 254, 200, 50)) {
+    manualFanMode = false;
     fanWrite(sensorOk && curTemp > COOLDOWN_TEMP);
     screen = SCR_HOME; drawHome();
   }
@@ -1102,46 +1207,51 @@ void touchFault(int tx, int ty) {
 // ---------------------------------------------------------------
 //                      SETTINGS + WIFI SETUP
 // ---------------------------------------------------------------
-void drawSettings() {
-  wifiUp = (WiFi.status() == WL_CONNECTED);   // always check live before drawing
-  newScreen("Settings");
-  tft.setTextDatum(TL_DATUM);
-  tft.fillRoundRect(12, 44, 456, 96, 10, C_CARD);
-  tft.setTextColor(C_MUTED, C_CARD);
-  tft.drawString("WiFi:", 24, 54, 2);
-  if (wifiUp) {
-    tft.setTextColor(C_GOOD, C_CARD);
-    char ip[52];
-    snprintf(ip, sizeof(ip), "%s  %s (DHCP)", cfgSsid.c_str(), WiFi.localIP().toString().c_str());
-    tft.drawString(ip, 70, 54, 2);
-    tft.setTextColor(C_MUTED, C_CARD);
-    tft.drawString("open the address in a phone browser", 24, 78, 2);
-    tft.drawString("router device name: spacepi-dryer", 24, 98, 2);
-  } else if (WiFi.getMode() & WIFI_AP) {
-    tft.setTextColor(C_ACCENT, C_CARD);
-    tft.drawString(AP_SSID, 70, 54, 2);
-    tft.setTextColor(C_MUTED, C_CARD);
-    tft.drawString("join this hotspot, open 192.168.4.1", 24, 78, 2);
+void themeTile(int x,int y,int w,int h,const char* label,bool selected,uint8_t kind,bool saverKind) {
+  uint16_t bg=selected?0x1230:C_CARD, edge=selected?C_ACCENT:0x3148;
+  tft.fillRoundRect(x,y,w,h,8,bg); tft.drawRoundRect(x,y,w,h,8,edge);
+  tft.setTextDatum(MC_DATUM);
+  if (saverKind) {
+    tft.setTextColor(kind==2?C_TEXT:C_ACCENT,bg);
+    if(kind==1) tft.drawCircle(x+w/2,y+24,15,C_ACCENT);
+    else if(kind==2){ for(int i=0;i<4;i++) tft.drawFastHLine(x+12,y+14+i*6,w-24,0x047F+i*0x20); }
+    else if(kind==3){ for(int i=0;i<10;i++) tft.fillCircle(x+10+(i*23)%(w-20),y+10+(i*17)%32,1,C_ACCENT); }
+    tft.drawString("20:06",x+w/2,y+28,2);
   } else {
-    tft.setTextColor(C_MUTED, C_CARD);
-    tft.drawString("not configured", 70, 54, 2);
+    tft.setTextColor(C_HOT,bg); tft.drawString("38",x+w/3,y+24,2);
+    tft.setTextColor(C_ACCENT,bg); tft.drawString("32",x+2*w/3,y+24,2);
+    if(kind==1) tft.drawCircle(x+w/2,y+24,20,C_ACCENT);
+    if(kind==2) tft.drawFastHLine(x+10,y+42,w-20,C_MUTED);
+    if(kind==3) tft.drawRoundRect(x+6,y+7,w-12,34,5,C_ACCENT);
   }
-  char v[48];
-  snprintf(v, sizeof(v), "Time: %s %s", clockStr, timeSynced ? "" : "(needs WiFi)");
-  tft.setTextColor(C_MUTED, C_CARD);
-  tft.drawString(v, 24, 118, 2);
-  btn(12,  160, 148, 50, "WIFI", C_ACCENT, 0x0000);
-  btn(172, 160, 148, 50, "CALIBRATE", C_CARD);
-  btn(332, 160, 136, 50, "BACK", C_CARD);
-  // screensaver toggle
-  btn(12, 220, 290, 44,
-      saverEnabled ? "SCREENSAVER: ON" : "SCREENSAVER: OFF",
-      saverEnabled ? C_GOOD : C_CARD, saverEnabled ? 0x0000 : C_TEXT);
-  char s[56];
-  snprintf(s, sizeof(s), "Safety: ceiling %.0fC, max set %dC (fixed)", MAX_TEMP_C, MAX_SET_TEMP);
-  tft.fillRoundRect(12, 274, 456, 24, 8, C_CARD);
-  tft.setTextColor(C_MUTED, C_CARD); tft.setTextDatum(TL_DATUM);
-  tft.drawString(s, 24, 278, 2);
+  tft.setTextColor(selected?C_ACCENT:C_TEXT,bg); tft.drawString(label,x+w/2,y+h-10,2);
+  if(selected){ tft.fillCircle(x+w-10,y+10,7,C_ACCENT); tft.setTextColor(0,bg); tft.drawString("+",x+w-10,y+10,2); }
+}
+
+void drawSettings() {
+  wifiUp=(WiFi.status()==WL_CONNECTED);
+  newScreen(settingsPage==0?"Settings: Appearance":"Settings: System");
+  btn(12,42,146,36,"APPEARANCE",settingsPage==0?C_ACCENT:C_CARD,settingsPage==0?0:C_TEXT);
+  btn(166,42,146,36,"SYSTEM",settingsPage==1?C_ACCENT:C_CARD,settingsPage==1?0:C_TEXT);
+  btn(320,42,148,36,"BACK",C_CARD);
+  if(settingsPage==0){
+    tft.setTextDatum(TL_DATUM); tft.setTextColor(C_MUTED,C_BG); tft.drawString("Main display style",16,84,2);
+    for(int i=0;i<4;i++){ char l[12]; snprintf(l,sizeof(l),"Style %d",i+1); themeTile(12+i*116,104,108,62,l,mainTheme==i,i,false); }
+    tft.setTextColor(C_MUTED,C_BG); tft.drawString("Screensaver style",16,174,2);
+    for(int i=0;i<4;i++){ char l[12]; snprintf(l,sizeof(l),"Style %d",i+1); themeTile(12+i*116,194,108,62,l,saverTheme==i,i,true); }
+    btn(12,270,144,38,saverEnabled?"SAVER ON":"SAVER OFF",saverEnabled?C_GOOD:C_CARD,saverEnabled?0:C_TEXT);
+    btn(168,270,144,38,antiFlicker?"ANTI-FLICKER ON":"ANTI-FLICKER OFF",antiFlicker?C_ACCENT:C_CARD,antiFlicker?0:C_TEXT);
+    btn(324,270,144,38,"PREVIEW",C_CARD);
+  } else {
+    tft.fillRoundRect(12,88,456,82,10,C_CARD); tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(wifiUp?C_GOOD:C_MUTED,C_CARD);
+    String net=wifiUp?(cfgSsid+"  "+WiFi.localIP().toString()):String("not connected / AP 192.168.4.1");
+    tft.drawString(net,24,100,2); tft.setTextColor(C_MUTED,C_CARD);
+    tft.drawString("Time: "+String(clockStr)+(timeSynced?"":" (needs WiFi)"),24,126,2);
+    btn(12,184,140,48,"WIFI",C_ACCENT,0); btn(164,184,140,48,"CALIBRATE",C_CARD); btn(316,184,152,48,"HOME",C_CARD);
+    char safe[64]; snprintf(safe,sizeof(safe),"Safety ceiling %.0fC | maximum set %dC",MAX_TEMP_C,MAX_SET_TEMP);
+    tft.fillRoundRect(12,248,456,48,8,C_CARD); tft.setTextColor(C_MUTED,C_CARD); tft.drawString(safe,24,262,2);
+  }
 }
 void runTouchCalibration() {
   tft.fillScreen(C_BG);
@@ -1246,406 +1356,19 @@ void touchKbd(int tx, int ty) {
 //                      WEB
 // ---------------------------------------------------------------
 const char PAGE[] PROGMEM =
-"<!DOCTYPE html>\n"
-"<html lang=\"en\">\n"
-"<head>\n"
-"<meta charset=\"UTF-8\">\n"
-"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
-"<title>SpacePi Dryer</title>\n"
-"<style>\n"
-":root{--bg:#0a0e1a;--card:#1a2035;--border:#2a3a55;--text:#e8edf5;--muted:#6b7a99;--accent:#0af;--hot:#f80;--good:#0c6;--bad:#e33;--r:12px}\n"
-"*{box-sizing:border-box;margin:0;padding:0}\n"
-"body{background:var(--bg);color:var(--text);font-family:system-ui,sans-serif;padding-bottom:70px}\n"
-"nav{position:fixed;bottom:0;left:0;right:0;background:#111827;border-top:1px solid var(--border);display:flex;z-index:10}\n"
-"nav button{flex:1;background:none;border:none;color:var(--muted);padding:12px 4px 8px;font-size:11px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px}\n"
-"nav button.on{color:var(--accent)}\n"
-"nav button svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round}\n"
-".page{display:none;padding:16px}\n"
-".page.on{display:block}\n"
-".card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:16px;margin-bottom:14px}\n"
-".lbl{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}\n"
-".big{font-size:40px;font-weight:700;line-height:1}\n"
-".hot{color:var(--hot)}.cool{color:var(--accent)}.ok{color:var(--good)}.err{color:var(--bad)}\n"
-".row{display:flex;gap:10px;margin-bottom:14px}\n"
-".row .card{flex:1;margin:0}\n"
-".bar-wrap{background:#232d45;border-radius:4px;height:8px;overflow:hidden;margin:8px 0}\n"
-".bar{height:100%;border-radius:4px;background:var(--accent);transition:width 1s linear}\n"
-".badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600}\n"
-".badge.heat{background:rgba(255,136,0,.15);color:var(--hot);border:1px solid rgba(255,136,0,.3)}\n"
-".badge.cool-badge{background:rgba(107,122,153,.15);color:var(--muted);border:1px solid var(--border)}\n"
-".badge.fan-on{background:rgba(0,170,255,.15);color:var(--accent);border:1px solid rgba(0,170,255,.3)}\n"
-".dot{width:7px;height:7px;border-radius:50%;background:currentColor}\n"
-"button.btn{display:inline-flex;align-items:center;justify-content:center;padding:11px 20px;border-radius:9px;font-size:14px;font-weight:600;cursor:pointer;border:none;margin:4px 4px 4px 0}\n"
-".btn-go{background:var(--good);color:#000}\n"
-".btn-stop{background:var(--bad);color:#fff}\n"
-".btn-neu{background:#232d45;color:var(--text);border:1px solid var(--border)}\n"
-".btn-acc{background:rgba(0,170,255,.2);color:var(--accent);border:1px solid rgba(0,170,255,.3)}\n"
-"input[type=range]{width:100%;accent-color:var(--accent);margin:6px 0}\n"
-"input[type=text]{width:100%;background:#232d45;border:1px solid var(--border);color:var(--text);padding:10px 12px;border-radius:9px;font-size:14px}\n"
-"select{width:100%;background:#232d45;border:1px solid var(--border);color:var(--text);padding:10px 12px;border-radius:9px;font-size:14px;margin-bottom:10px}\n"
-".preset-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}\n"
-".pb{background:#232d45;border:1px solid var(--border);color:var(--muted);padding:10px 4px;border-radius:9px;font-size:12px;cursor:pointer;text-align:center;line-height:1.5}\n"
-".pb.on{border-color:var(--accent);background:rgba(0,170,255,.1);color:var(--accent)}\n"
-".pb b{display:block;font-size:13px}\n"
-"#conn-bar{height:3px;background:var(--bad);transition:background .3s}\n"
-"#conn-bar.ok{background:var(--good)}\n"
-"table{width:100%;border-collapse:collapse;font-size:12px}\n"
-"td,th{padding:7px 4px;border-bottom:1px solid var(--border);text-align:center}\n"
-"th{color:var(--muted);font-size:11px;text-transform:uppercase}\n"
-"td:first-child,th:first-child{text-align:left}\n"
-"canvas{width:100%;display:block}\n"
-"#toast{position:fixed;bottom:76px;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--border);border-radius:9px;padding:10px 18px;font-size:13px;opacity:0;transition:opacity .3s;pointer-events:none;z-index:99;white-space:nowrap}\n"
-"#toast.on{opacity:1}\n"
-"</style>\n"
-"</head>\n"
-"<body>\n"
-"<div id=\"conn-bar\"></div>\n"
-"\n"
-"<!-- DASHBOARD -->\n"
-"<div class=\"page on\" id=\"p-dash\">\n"
-"  <div class=\"row\">\n"
-"    <div class=\"card\"><div class=\"lbl\">Temperature</div><div class=\"big hot\" id=\"d-t\">--</div><div style=\"color:var(--muted);font-size:12px\"> CC</div></div>\n"
-"    <div class=\"card\"><div class=\"lbl\">Humidity</div><div class=\"big cool\" id=\"d-h\">--</div><div style=\"color:var(--muted);font-size:12px\">%RH</div></div>\n"
-"  </div>\n"
-"  <div class=\"card\">\n"
-"    <div class=\"lbl\">Time remaining</div>\n"
-"    <div class=\"big\" id=\"d-timer\" style=\"font-size:30px;font-family:monospace\">--:--:--</div>\n"
-"    <div class=\"bar-wrap\"><div class=\"bar\" id=\"d-bar\" style=\"width:0%\"></div></div>\n"
-"    <div style=\"font-size:12px;color:var(--muted)\" id=\"d-prog\">idle</div>\n"
-"  </div>\n"
-"  <div class=\"row\">\n"
-"    <div class=\"card\" style=\"display:flex;align-items:center;gap:10px\">\n"
-"      <canvas id=\"c-flame\" width=\"44\" height=\"54\"></canvas>\n"
-"      <div><div class=\"lbl\">Heater</div><span class=\"badge cool-badge\" id=\"d-hbadge\"><span class=\"dot\"></span>OFF</span></div>\n"
-"    </div>\n"
-"    <div class=\"card\" style=\"display:flex;align-items:center;gap:10px\">\n"
-"      <canvas id=\"c-fan\" width=\"44\" height=\"44\"></canvas>\n"
-"      <div><div class=\"lbl\">Fan</div><span class=\"badge cool-badge\" id=\"d-fbadge\"><span class=\"dot\"></span>OFF</span></div>\n"
-"    </div>\n"
-"  </div>\n"
-"  <div class=\"card\" id=\"fault-box\" style=\"display:none;border-color:var(--bad)\">\n"
-"    <div class=\"lbl err\">Fault</div>\n"
-"    <div id=\"fault-msg\" style=\"margin:6px 0;font-size:14px\"></div>\n"
-"    <button class=\"btn btn-neu\" onclick=\"api('action=reset')\">Reset (unlocks when cool)</button>\n"
-"  </div>\n"
-"</div>\n"
-"\n"
-"<!-- CONTROL -->\n"
-"<div class=\"page\" id=\"p-ctrl\">\n"
-"  <div class=\"card\">\n"
-"    <div class=\"lbl\">Preset</div>\n"
-"    <div class=\"preset-grid\" id=\"presets\"></div>\n"
-"    <div class=\"lbl\">Temperature</div>\n"
-"    <div style=\"display:flex;align-items:center;gap:10px\">\n"
-"      <input type=\"range\" id=\"sl-t\" min=\"35\" max=\"85\" step=\"5\" value=\"50\" oninput=\"document.getElementById('lbl-t').textContent=this.value+' CC'\">\n"
-"      <span id=\"lbl-t\" style=\"min-width:44px;font-weight:600\">50 CC</span>\n"
-"    </div>\n"
-"    <div class=\"lbl\" style=\"margin-top:10px\">Duration</div>\n"
-"    <div style=\"display:flex;align-items:center;gap:10px\">\n"
-"      <input type=\"range\" id=\"sl-h\" min=\"0.5\" max=\"24\" step=\"0.5\" value=\"6\" oninput=\"updateDur()\">\n"
-"      <span id=\"lbl-h\" style=\"min-width:44px;font-weight:600\">6:00</span>\n"
-"    </div>\n"
-"    <div style=\"margin-top:12px\">\n"
-"      <button class=\"btn btn-go\" onclick=\"startDry()\">> Start</button>\n"
-"      <button class=\"btn btn-stop\" onclick=\"api('action=stop')\">[..] Stop</button>\n"
-"    </div>\n"
-"  </div>\n"
-"  <div class=\"card\">\n"
-"    <div class=\"lbl\">Fault reset</div>\n"
-"    <div style=\"font-size:13px;color:var(--muted);margin-bottom:10px\">Available after chamber cools below 50 CC</div>\n"
-"    <button class=\"btn btn-acc\" onclick=\"api('action=reset')\">Reset fault</button>\n"
-"  </div>\n"
-"</div>\n"
-"\n"
-"<!-- HISTORY -->\n"
-"<div class=\"page\" id=\"p-hist\">\n"
-"  <div class=\"row\" style=\"flex-wrap:wrap\">\n"
-"    <div class=\"card\" style=\"min-width:80px\"><div class=\"lbl\">Total</div><div class=\"big\" style=\"font-size:28px\" id=\"hs-tot\">--</div></div>\n"
-"    <div class=\"card\" style=\"min-width:80px\"><div class=\"lbl\">Done</div><div class=\"big ok\" style=\"font-size:28px\" id=\"hs-ok\">--</div></div>\n"
-"    <div class=\"card\" style=\"min-width:80px\"><div class=\"lbl\">Stopped</div><div class=\"big hot\" style=\"font-size:28px\" id=\"hs-st\">--</div></div>\n"
-"    <div class=\"card\" style=\"min-width:80px\"><div class=\"lbl\">Faults</div><div class=\"big err\" style=\"font-size:28px\" id=\"hs-er\">--</div></div>\n"
-"  </div>\n"
-"  <div class=\"card\">\n"
-"    <div class=\"lbl\">Peak temp per run (last 30)</div>\n"
-"    <canvas id=\"c-chart\" height=\"140\"></canvas>\n"
-"  </div>\n"
-"  <div class=\"card\" id=\"fault-log\" style=\"display:none\">\n"
-"    <div class=\"lbl\">Fault log</div>\n"
-"    <div id=\"fault-log-body\" style=\"font-size:13px;margin-top:8px\"></div>\n"
-"  </div>\n"
-"  <div class=\"card\">\n"
-"    <div class=\"lbl\">Run log</div>\n"
-"    <div style=\"overflow-x:auto\">\n"
-"      <table>\n"
-"        <thead><tr><th>Date</th><th>Preset</th><th>Peak</th><th>Hum</th><th>Result</th></tr></thead>\n"
-"        <tbody id=\"runs-body\"></tbody>\n"
-"      </table>\n"
-"      <p id=\"runs-empty\" style=\"text-align:center;color:var(--muted);padding:20px;font-size:13px\">No runs yet</p>\n"
-"    </div>\n"
-"    <button class=\"btn btn-neu\" style=\"margin-top:10px\" onclick=\"clearHist()\">Clear history</button>\n"
-"  </div>\n"
-"</div>\n"
-"\n"
-"<!-- SETTINGS -->\n"
-"<div class=\"page\" id=\"p-set\">\n"
-"  <div class=\"card\">\n"
-"    <div class=\"lbl\">Connection</div>\n"
-"    <div style=\"font-size:13px;color:var(--muted);margin-bottom:10px\">\n"
-"      Open this page from the dryer's IP address and it connects automatically.<br>\n"
-"      Or enter the IP manually below.\n"
-"    </div>\n"
-"    <input type=\"text\" id=\"ip-in\" placeholder=\"192.168.1.x\" style=\"margin-bottom:8px\">\n"
-"    <button class=\"btn btn-acc\" onclick=\"saveIp()\">Connect</button>\n"
-"    <div style=\"font-size:12px;color:var(--muted);margin-top:8px\" id=\"ip-status\">--</div>\n"
-"  </div>\n"
-"  <div class=\"card\">\n"
-"    <div class=\"lbl\">About</div>\n"
-"    <div style=\"font-size:13px;color:var(--muted);line-height:1.8\">\n"
-"      SpacePi Dryer - Mod v01 Mike<br>\n"
-"      Safety limits enforced on device only.<br>\n"
-"      <a href=\"https://github.com/mehregan59/Filament-dryer\" style=\"color:var(--accent)\">GitHub</a><br><br>\n"
-"<b style=\"color:var(--hot)\">Multiple devices:</b> polling auto-pauses when this tab is hidden or screen is off.\n"
-"If another device is connected, close or background that browser tab first.\n"
-"    </div>\n"
-"  </div>\n"
-"</div>\n"
-"\n"
-"<!-- BOTTOM NAV -->\n"
-"<nav>\n"
-"  <button class=\"on\" onclick=\"nav('dash',this)\">\n"
-"    <svg viewBox=\"0 0 24 24\"><rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1\"/></svg>\n"
-"    Dashboard\n"
-"  </button>\n"
-"  <button onclick=\"nav('ctrl',this)\">\n"
-"    <svg viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"3\"/><path d=\"M12 2v3M12 19v3M4.22 4.22l2.12 2.12M17.66 17.66l2.12 2.12M2 12h3M19 12h3M4.22 19.78l2.12-2.12M17.66 6.34l2.12-2.12\"/></svg>\n"
-"    Control\n"
-"  </button>\n"
-"  <button onclick=\"nav('hist',this);loadHist()\">\n"
-"    <svg viewBox=\"0 0 24 24\"><polyline points=\"22 12 18 12 15 21 9 3 6 12 2 12\"/></svg>\n"
-"    History\n"
-"  </button>\n"
-"  <button onclick=\"nav('set',this)\">\n"
-"    <svg viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"3\"/><path d=\"M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z\"/></svg>\n"
-"    Settings\n"
-"  </button>\n"
-"</nav>\n"
-"<div id=\"toast\"></div>\n"
-"\n"
-"<script>\n"
-"// -- STATE ----------------------------------------------------------\n"
-"const PRESETS=[{n:'PLA',t:50,h:6},{n:'PETG',t:60,h:6},{n:'ABS',t:70,h:8},{n:'ASA',t:70,h:8},{n:'PA/NY',t:80,h:12},{n:'PC',t:85,h:10}];\n"
-"let ip='', poll_t=null, af=0, fa=0, sel=0, connected=false, dryer={}, totalMs=0, startMs=0;\n"
-"\n"
-"// -- IP DETECTION ---------------------------------------------------\n"
-"// If served from ESP32 directly, use its IP - no CORS, no config needed\n"
-"function detectIp() {\n"
-"  const h = location.hostname;\n"
-"  if (h && h !== 'localhost' && h !== '127.0.0.1' && location.protocol === 'http:') {\n"
-"    ip = h;  // page served from ESP32 - use same host\n"
-"    document.getElementById('ip-in').value = ip;\n"
-"    document.getElementById('ip-status').textContent = 'Auto-connected to ' + ip;\n"
-"    return true;\n"
-"  }\n"
-"  const stored = localStorage.getItem('dryer_ip');\n"
-"  if (stored) { ip = stored; document.getElementById('ip-in').value = ip; return true; }\n"
-"  return false;\n"
-"}\n"
-"\n"
-"// -- FETCH - always relative when same host, absolute otherwise -----\n"
-"function apiUrl(path) {\n"
-"  if (ip && ip === location.hostname) return path;   // same origin - no CORS at all\n"
-"  return 'http://' + ip + path;\n"
-"}\n"
-"\n"
-"async function apiFetch(path, opts) {\n"
-"  // When same-origin: no mode needed. When cross-origin: use cors.\n"
-"  const same = ip === location.hostname;\n"
-"  const defaults = { cache: 'no-store', signal: AbortSignal.timeout(4000) };\n"
-"  if (!same) defaults.mode = 'cors';\n"
-"  return fetch(apiUrl(path), Object.assign(defaults, opts));\n"
-"}\n"
-"\n"
-"// -- POLLING --------------------------------------------------------\n"
-"function startPoll() {\n"
-"  if (poll_t) clearInterval(poll_t);\n"
-"  doPoll();\n"
-"  poll_t = setInterval(doPoll, 2000);\n"
-"}\n"
-"async function doPoll() {\n"
-"  if (!ip) return;\n"
-"  try {\n"
-"    const r = await apiFetch('/api');\n"
-"    if (!r.ok) throw new Error(r.status);\n"
-"    dryer = await r.json();\n"
-"    connected = true;\n"
-"    document.getElementById('conn-bar').className = 'ok';\n"
-"    document.getElementById('ip-status').textContent = 'Connected . ' + ip;\n"
-"    render();\n"
-"  } catch(e) {\n"
-"    connected = false;\n"
-"    document.getElementById('conn-bar').className = '';\n"
-"    document.getElementById('ip-status').textContent = 'Cannot connect to ' + ip;\n"
-"  }\n"
-"}\n"
-"\n"
-"async function api(q) {\n"
-"  if (!ip) return toast('Not connected');\n"
-"  try {\n"
-"    const r = await apiFetch('/cmd?' + q);\n"
-"    toast(await r.text()); doPoll();\n"
-"  } catch(e) { toast('Failed'); }\n"
-"}\n"
-"\n"
-"// -- RENDER ---------------------------------------------------------\n"
-"function render() {\n"
-"  const d = dryer;\n"
-"  document.getElementById('d-t').textContent = (+d.t).toFixed(1);\n"
-"  document.getElementById('d-h').textContent = Math.round(+d.h);\n"
-"  document.getElementById('d-timer').textContent = d.left || '--:--:--';\n"
-"  const dry = d.state === 'drying';\n"
-"  if (dry && d.left && d.left !== '--:--:--') {\n"
-"    const [hh,mm,ss] = d.left.split(':').map(Number);\n"
-"    const left = hh*3600+mm*60+ss;\n"
-"    if (!startMs) { startMs = Date.now(); totalMs = left*1000; }\n"
-"    const pct = totalMs ? Math.min(100,(totalMs-left*1000)/totalMs*100) : 0;\n"
-"    document.getElementById('d-bar').style.width = pct.toFixed(1)+'%';\n"
-"    document.getElementById('d-prog').textContent = pct.toFixed(0)+'% - '+d.left+' left';\n"
-"  } else { startMs=0; document.getElementById('d-bar').style.width=d.state==='finished'?'100%':'0%'; document.getElementById('d-prog').textContent=d.state; }\n"
-"  setBadge('d-hbadge', d.heater, 'heat', 'HEATING', 'cool-badge', 'HOLDING');\n"
-"  setBadge('d-fbadge', d.fan,    'fan-on','FAN ON', 'cool-badge', 'OFF');\n"
-"  const fb = document.getElementById('fault-box');\n"
-"  const fault = d.state && (d.state.startsWith('E') || d.state.startsWith('e'));\n"
-"  fb.style.display = fault ? 'block' : 'none';\n"
-"  if (fault) document.getElementById('fault-msg').textContent = d.state;\n"
-"}\n"
-"function setBadge(id, val, cls1, lbl1, cls2, lbl2) {\n"
-"  const el = document.getElementById(id);\n"
-"  el.className = 'badge ' + (val ? cls1 : cls2);\n"
-"  el.innerHTML = '<span class=\"dot\"></span>' + (val ? lbl1 : lbl2);\n"
-"}\n"
-"\n"
-"// -- NAV ------------------------------------------------------------\n"
-"function nav(id, btn) {\n"
-"  document.querySelectorAll('.page').forEach(p=>p.classList.remove('on'));\n"
-"  document.querySelectorAll('nav button').forEach(b=>b.classList.remove('on'));\n"
-"  document.getElementById('p-'+id).classList.add('on');\n"
-"  btn.classList.add('on');\n"
-"}\n"
-"\n"
-"// -- PRESETS --------------------------------------------------------\n"
-"function buildPresets() {\n"
-"  document.getElementById('presets').innerHTML = PRESETS.map((p,i)=>\n"
-"    `<button class=\"pb${i===0?' on':''}\" onclick=\"selPreset(${i})\"><b>${p.n}</b>${p.t} CC . ${p.h}h</button>`\n"
-"  ).join('');\n"
-"}\n"
-"function selPreset(i) {\n"
-"  sel=i;\n"
-"  document.querySelectorAll('.pb').forEach((b,j)=>b.classList.toggle('on',j===i));\n"
-"  document.getElementById('sl-t').value=PRESETS[i].t;\n"
-"  document.getElementById('lbl-t').textContent=PRESETS[i].t+' CC';\n"
-"  document.getElementById('sl-h').value=PRESETS[i].h;\n"
-"  updateDur();\n"
-"}\n"
-"function updateDur() {\n"
-"  const v=+document.getElementById('sl-h').value;\n"
-"  document.getElementById('lbl-h').textContent=Math.floor(v)+':'+(v%1?.5*60<10?'0':''+(v%1?30:0)+'').padStart(2,'0');\n"
-"}\n"
-"function startDry() {\n"
-"  const t=document.getElementById('sl-t').value;\n"
-"  const m=Math.round(+document.getElementById('sl-h').value*60);\n"
-"  api('action=start&preset='+sel+'&temp='+t+'&min='+m);\n"
-"}\n"
-"\n"
-"// -- HISTORY --------------------------------------------------------\n"
-"async function loadHist() {\n"
-"  if (!ip) return;\n"
-"  try {\n"
-"    const r = await apiFetch('/history');\n"
-"    const d = await r.json();\n"
-"    document.getElementById('hs-tot').textContent=d.stats.total;\n"
-"    document.getElementById('hs-ok').textContent=d.stats.completed;\n"
-"    document.getElementById('hs-st').textContent=d.stats.stopped;\n"
-"    document.getElementById('hs-er').textContent=d.stats.faulted;\n"
-"    drawChart(d.runs.slice(-30));\n"
-"    // fault log\n"
-"    const fl=document.getElementById('fault-log'), fb=document.getElementById('fault-log-body');\n"
-"    if(d.faults.length){fl.style.display='block';fb.innerHTML=d.faults.slice().reverse().map(f=>`<div style=\"padding:4px 0;border-bottom:1px solid var(--border);color:var(--bad)\">${f.code} <span style=\"color:var(--muted);float:right\">${f.ts?new Date(f.ts*1000).toLocaleString():'--'}</span></div>`).join('');}else{fl.style.display='none';}\n"
-"    // table\n"
-"    const tb=document.getElementById('runs-body'), em=document.getElementById('runs-empty');\n"
-"    if(!d.runs.length){tb.innerHTML='';em.style.display='block';return;}\n"
-"    em.style.display='none';\n"
-"    const rc={completed:'<span style=\"color:var(--good)\">OK</span>',stopped:'<span style=\"color:var(--hot)\">[]</span>',faulted:'<span style=\"color:var(--bad)\">!</span>'};\n"
-"    tb.innerHTML=d.runs.slice().reverse().map(r=>`<tr><td>${r.ts?new Date(r.ts*1000).toLocaleDateString():'--'}</td><td>${r.preset}</td><td style=\"color:var(--hot)\">${r.peak} CC</td><td>${r.startHum}->${r.endHum}%</td><td>${rc[r.outcome]||r.outcome}</td></tr>`).join('');\n"
-"  } catch(e) { toast('History load failed'); }\n"
-"}\n"
-"function drawChart(runs) {\n"
-"  const c=document.getElementById('c-chart'), ctx=c.getContext('2d');\n"
-"  c.width=c.offsetWidth||360; c.height=140;\n"
-"  ctx.clearRect(0,0,c.width,c.height);\n"
-"  if(!runs.length){ctx.fillStyle='#3a4a6a';ctx.font='13px system-ui';ctx.textAlign='center';ctx.fillText('No runs yet',c.width/2,70);return;}\n"
-"  const pad={l:28,r:8,t:8,b:20},cw=c.width-pad.l-pad.r,ch=c.height-pad.t-pad.b;\n"
-"  const maxT=Math.max(...runs.map(r=>r.peak),50);\n"
-"  const bw=Math.max(4,cw/runs.length*.7),gap=cw/runs.length;\n"
-"  for(let i=0;i<=4;i++){const y=pad.t+i*(ch/4);ctx.fillStyle='#1e2a42';ctx.fillRect(pad.l,y,cw,.5);ctx.fillStyle='#4a6080';ctx.font='9px monospace';ctx.textAlign='right';ctx.fillText((maxT-i*maxT/4).toFixed(0),pad.l-3,y+3);}\n"
-"  const oc={completed:'#0c6',stopped:'#f80',faulted:'#e33'};\n"
-"  runs.forEach((r,i)=>{const x=pad.l+i*gap+gap/2-bw/2,h=(r.peak/maxT)*ch,y=pad.t+ch-h;ctx.fillStyle=oc[r.outcome]||'#4a6080';ctx.fillRect(x,y,bw,h);});\n"
-"}\n"
-"async function clearHist() {\n"
-"  if(!confirm('Clear all history?'))return;\n"
-"  await apiFetch('/history/clear'); toast('Cleared'); loadHist();\n"
-"}\n"
-"\n"
-"// -- ANIMATIONS -----------------------------------------------------\n"
-"function drawFlame(on) {\n"
-"  const c=document.getElementById('c-flame'),ctx=c.getContext('2d');\n"
-"  ctx.clearRect(0,0,44,54);\n"
-"  if(on){const fl=af%5;ctx.fillStyle='#f80';ctx.beginPath();ctx.moveTo(22-11,50);ctx.quadraticCurveTo(4,32,22,14-fl);ctx.quadraticCurveTo(40,32,22+11,50);ctx.closePath();ctx.fill();ctx.fillStyle='#ffe040';ctx.beginPath();ctx.moveTo(22-6,50);ctx.quadraticCurveTo(13,38,22,26-fl);ctx.quadraticCurveTo(31,38,22+6,50);ctx.closePath();ctx.fill();}\n"
-"  else{ctx.fillStyle='#1a3060';ctx.beginPath();ctx.ellipse(22,44,12,7,0,0,Math.PI*2);ctx.fill();ctx.fillStyle='#2244a0';ctx.beginPath();ctx.moveTo(15,44);ctx.lineTo(29,44);ctx.lineTo(22,26);ctx.closePath();ctx.fill();ctx.strokeStyle='#0af';ctx.lineWidth=1.5;[[8,36,36,36],[22,24,22,48],[13,29,31,43],[31,29,13,43]].forEach(([x1,y1,x2,y2])=>{ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();});}\n"
-"}\n"
-"function drawFan(on) {\n"
-"  const c=document.getElementById('c-fan'),ctx=c.getContext('2d'),cx=22,cy=22;\n"
-"  ctx.clearRect(0,0,44,44);\n"
-"  ctx.strokeStyle=on?'#0af':'#334';ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(cx,cy,18,0,Math.PI*2);ctx.stroke();\n"
-"  for(let b=0;b<4;b++){const a=fa+b*Math.PI/2;ctx.fillStyle=on?'#0af':'#2a3a50';ctx.beginPath();ctx.moveTo(cx+15*Math.cos(a),cy+15*Math.sin(a));ctx.lineTo(cx+6*Math.cos(a+.6),cy+6*Math.sin(a+.6));ctx.lineTo(cx+6*Math.cos(a-.6),cy+6*Math.sin(a-.6));ctx.closePath();ctx.fill();}\n"
-"  ctx.fillStyle='#eee';ctx.beginPath();ctx.arc(cx,cy,3.5,0,Math.PI*2);ctx.fill();\n"
-"  if(!on){ctx.strokeStyle='#e33';ctx.beginPath();ctx.moveTo(13,13);ctx.lineTo(31,31);ctx.stroke();ctx.beginPath();ctx.moveTo(31,13);ctx.lineTo(13,31);ctx.stroke();}\n"
-"}\n"
-"function animLoop(){\n"
-"  af++;if(dryer.fan)fa+=.1;\n"
-"  drawFlame(dryer.heater);drawFan(dryer.fan);\n"
-"  requestAnimationFrame(animLoop);\n"
-"}\n"
-"\n"
-"// -- SETTINGS -------------------------------------------------------\n"
-"function saveIp(){\n"
-"  const v=document.getElementById('ip-in').value.trim();\n"
-"  if(!v)return toast('Enter an IP');\n"
-"  ip=v;localStorage.setItem('dryer_ip',ip);\n"
-"  document.getElementById('ip-status').textContent='Connecting...';\n"
-"  startPoll();\n"
-"}\n"
-"\n"
-"// -- TOAST ----------------------------------------------------------\n"
-"function toast(m){const t=document.getElementById('toast');t.textContent=m;t.className='on';setTimeout(()=>t.className='',2500);}\n"
-"\n"
-"// -- INIT -----------------------------------------------------------\n"
-"buildPresets(); updateDur();\n"
-"// Multi-client: pause polling if page hidden (phone screen off / different tab)\n"
-"// This prevents laptop polling from blocking phone and vice versa\n"
-"document.addEventListener('visibilitychange', function() {\n"
-"  if (document.hidden) {\n"
-"    if (poll_t) { clearInterval(poll_t); poll_t = null; }\n"
-"  } else {\n"
-"    if (ip) startPoll();\n"
-"  }\n"
-"});\n"
-"if (detectIp()) startPoll();\n"
-"animLoop();\n"
-"</script>\n"
-"</body>\n"
-"</html>\n"
-"\n"
+"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>SpacePi Dryer</title><style>\n"
+":root{--bg:#070b14;--panel:#10192a;--panel2:#15223a;--line:#263a5d;--text:#f3f7ff;--muted:#8494b3;--blue:#1597ff;--orange:#ff8a1f;--green:#32d583;--red:#ff4d5f;--shadow:0 18px 50px #0008}*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:radial-gradient(circle at 20% 0,#10213f 0,#070b14 42%);color:var(--text);font:15px/1.45 Inter,system-ui,sans-serif}button,input,select{font:inherit}.app{min-height:100vh}.side{position:fixed;inset:auto 0 0 0;height:72px;background:#0b1220ee;border-top:1px solid var(--line);display:flex;z-index:20;backdrop-filter:blur(14px)}.brand{display:none}.nav{display:flex;width:100%}.nav button{flex:1;border:0;background:transparent;color:var(--muted);padding:9px 4px;font-size:11px}.nav button b{display:block;font-size:20px;line-height:1}.nav button.on{color:var(--blue)}main{padding:16px 16px 92px;max-width:1480px;margin:auto}.page{display:none}.page.on{display:block}.top{display:flex;justify-content:space-between;align-items:center;margin:2px 0 16px}.top h1{font-size:23px;margin:0}.connected{color:var(--green);font-size:13px}.grid{display:grid;gap:14px}.card{background:linear-gradient(145deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:var(--shadow)}.hero{display:grid;gap:14px}.clock{font:700 clamp(52px,13vw,112px)/1 ui-monospace,monospace;letter-spacing:-.08em;color:#fff}.eyebrow{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.12em}.stats{display:grid;grid-template-columns:1fr 1fr;gap:12px}.value{font-size:36px;font-weight:800}.hot{color:var(--orange)}.cool{color:var(--blue)}.status{display:flex;align-items:center;gap:9px}.dot{width:9px;height:9px;border-radius:50%;background:currentColor}.actions{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.btn{border:1px solid var(--line);background:#172640;color:var(--text);border-radius:13px;padding:13px;cursor:pointer;font-weight:700}.btn.primary{background:linear-gradient(135deg,#0878e9,#19a7ff);border:0}.btn.danger{border-color:#7b2631;color:#ff7784;background:#28141b}.btn.orange{color:var(--orange)}.bar{height:9px;background:#21304a;border-radius:99px;overflow:hidden}.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#0878e9,#26b6ff);transition:width .4s}.quick{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.quick button{min-height:78px}.quick span{display:block;font-size:22px}.charts{grid-template-columns:1fr}.chart{height:150px;width:100%}.controls{display:grid;gap:12px}.control-row{display:grid;grid-template-columns:1fr auto;align-items:center;gap:12px;padding:13px;border:1px solid var(--line);border-radius:14px;background:#0c1526}.switch{min-width:92px}.themes{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.theme{border:1px solid var(--line);background:#0b1424;color:var(--muted);padding:9px;border-radius:13px;cursor:pointer}.theme.on{border-color:var(--blue);color:var(--blue);box-shadow:0 0 0 1px #1597ff55}.preview{height:74px;border-radius:9px;background:#030711;display:flex;align-items:center;justify-content:center;font:700 22px ui-monospace;margin-bottom:7px;overflow:hidden}.preview.ring:before{content:\"20:06\";display:grid;place-items:center;width:58px;height:58px;border:4px solid #168fff;border-radius:50%}.preview.split{gap:5px}.preview.split i{font-style:normal;padding:13px 8px;border-radius:7px;background:#132543}.preview.cards{gap:7px}.preview.cards i{font-style:normal;border:1px solid #294a75;padding:12px 8px;border-radius:8px}.settings-grid{display:grid;gap:14px}.range{width:100%;accent-color:var(--blue)}select,input[type=number]{background:#0c1526;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:10px}.presets{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}.preset{border:1px solid var(--line);background:#0c1526;color:var(--muted);padding:11px;border-radius:11px}.preset.on{color:var(--blue);border-color:var(--blue)}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:10px 6px;border-bottom:1px solid var(--line);text-align:left}th{color:var(--muted)}.notice{color:var(--muted);font-size:13px}.toast{position:fixed;left:50%;bottom:88px;transform:translateX(-50%);background:#15223a;border:1px solid var(--line);padding:10px 18px;border-radius:12px;opacity:0;pointer-events:none;transition:.2s;z-index:50}.toast.on{opacity:1}\n"
+"@media(min-width:900px){.app{display:grid;grid-template-columns:250px 1fr}.side{inset:0 auto 0 0;width:250px;height:auto;display:block;border:0;border-right:1px solid var(--line);padding:24px 16px}.brand{display:block;font-size:22px;font-weight:800;margin:4px 10px 30px}.brand small{display:block;color:var(--muted);font-size:12px;font-weight:400;margin-top:4px}.nav{display:grid;gap:6px}.nav button{display:flex;gap:12px;align-items:center;text-align:left;border-radius:12px;padding:13px 14px;font-size:14px}.nav button b{font-size:18px}.nav button.on{background:#142747}.content{grid-column:2}main{padding:28px 30px 40px}.dashboard{grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr)}.hero{grid-column:1}.rightcol{grid-column:2;grid-row:1/3}.charts{grid-template-columns:1fr 1fr}.settings-grid{grid-template-columns:1fr 1fr}.themes{grid-template-columns:repeat(4,1fr)}.toast{bottom:28px}.clock{font-size:84px}.actions{grid-template-columns:1fr 1fr}.quick{grid-template-columns:repeat(4,1fr)}}\n"
+"</style></head><body><div class=\"app\"><aside class=\"side\"><div class=\"brand\">SpacePi Dryer<small id=\"device-ip\">Local controller</small></div><div class=\"nav\"><button class=\"on\" data-page=\"dash\"><b>\u25a6</b>Dashboard</button><button data-page=\"control\"><b>\u2637</b>Control</button><button data-page=\"history\"><b>\u2301</b>History</button><button data-page=\"settings\"><b>\u2699</b>Settings</button></div></aside><div class=\"content\"><main>\n"
+"<section class=\"page on\" id=\"dash\"><div class=\"top\"><h1>Dashboard</h1><span class=\"connected\" id=\"online\">\u25cf Connecting</span></div><div class=\"grid dashboard\"><div class=\"hero\"><div class=\"card\"><div class=\"eyebrow\" id=\"date\">SpacePi Dryer</div><div class=\"clock\" id=\"clock\">--:--</div><div class=\"status notice\"><span class=\"dot\" id=\"state-dot\"></span><span id=\"state\">Waiting for device</span></div></div><div class=\"stats\"><div class=\"card\"><div class=\"eyebrow\">Temperature</div><div class=\"value hot\"><span id=\"temp\">--</span>\u00b0C</div></div><div class=\"card\"><div class=\"eyebrow\">Humidity</div><div class=\"value cool\"><span id=\"hum\">--</span>%</div></div></div><div class=\"card\"><div class=\"eyebrow\">Time remaining</div><div class=\"value\" id=\"left\">--:--:--</div><div class=\"bar\"><i id=\"progress\"></i></div><div class=\"notice\" id=\"progress-label\">Idle</div></div><div class=\"quick\"><button class=\"btn\" onclick=\"startDry()\"><span>\u25b6</span>Start</button><button class=\"btn danger\" onclick=\"cmd('stop')\"><span>\u25a0</span>Stop</button><button class=\"btn\" onclick=\"cmd('fan_on')\"><span>\u2723</span>Fan only</button><button class=\"btn\" onclick=\"showPage('settings')\"><span>\u2699</span>Settings</button></div><div class=\"grid charts\"><div class=\"card\"><div class=\"eyebrow hot\">Temperature \u00b7 last hour</div><canvas id=\"tempChart\" class=\"chart\"></canvas></div><div class=\"card\"><div class=\"eyebrow cool\">Humidity \u00b7 last hour</div><canvas id=\"humChart\" class=\"chart\"></canvas></div></div></div><div class=\"rightcol grid\"><div class=\"card\"><div class=\"eyebrow\">System status</div><div class=\"control-row\"><span>Heater</span><strong class=\"hot\" id=\"heater\">OFF</strong></div><div class=\"control-row\"><span>Fan</span><strong class=\"cool\" id=\"fan\">OFF</strong></div><div class=\"control-row\"><span>Controller</span><strong id=\"health\" style=\"color:var(--green)\">Normal</strong></div></div><div class=\"card\"><div class=\"eyebrow\">Quick controls</div><div class=\"actions\"><button class=\"btn primary\" onclick=\"startDry()\">Start cycle</button><button class=\"btn danger\" onclick=\"cmd('stop')\">Stop</button><button class=\"btn\" onclick=\"cmd('fan_on')\">Fan ON</button><button class=\"btn\" onclick=\"cmd('fan_off')\">Fan OFF</button></div></div></div></div></section>\n"
+"<section class=\"page\" id=\"control\"><div class=\"top\"><h1>Control</h1></div><div class=\"settings-grid\"><div class=\"card\"><div class=\"eyebrow\">Drying preset</div><div class=\"presets\" id=\"presets\"></div><p>Target temperature: <strong class=\"hot\" id=\"targetLabel\">50\u00b0C</strong></p><input class=\"range\" id=\"target\" type=\"range\" min=\"35\" max=\"85\" step=\"5\" value=\"50\" oninput=\"targetLabel.textContent=this.value+'\u00b0C'\"><p>Duration: <strong id=\"durationLabel\">6:00</strong></p><input class=\"range\" id=\"duration\" type=\"range\" min=\"30\" max=\"1440\" step=\"30\" value=\"360\" oninput=\"durationLabel.textContent=fmtMin(+this.value)\"><div class=\"actions\"><button class=\"btn primary\" onclick=\"startDry()\">Start drying</button><button class=\"btn danger\" onclick=\"cmd('stop')\">Stop</button></div></div><div class=\"card\"><div class=\"eyebrow\">Manual fan</div><p class=\"notice\">The fan can run without the heater. It cannot be switched off during drying or while cooling is required.</p><div class=\"actions\"><button class=\"btn\" onclick=\"cmd('fan_on')\">Fan ON</button><button class=\"btn\" onclick=\"cmd('fan_off')\">Fan OFF</button></div></div></div></section>\n"
+"<section class=\"page\" id=\"history\"><div class=\"top\"><h1>History</h1><div style=\"display:flex;gap:10px\"><button class=\"btn\" onclick=\"loadHistory()\">Refresh</button><button class=\"btn danger\" onclick=\"clearHistory()\">Clear history</button></div></div><div class=\"card\"><table><thead><tr><th>Date</th><th>Preset</th><th>Peak</th><th>Humidity</th><th>Result</th></tr></thead><tbody id=\"historyBody\"><tr><td colspan=\"5\" class=\"notice\">No data loaded</td></tr></tbody></table></div></section>\n"
+"<section class=\"page\" id=\"settings\"><div class=\"top\"><h1>Settings & appearance</h1></div><div class=\"settings-grid\"><div class=\"card\"><div class=\"eyebrow\">Main display theme</div><p class=\"notice\">Choose one of the four LCD home-screen layouts.</p><div class=\"themes\" id=\"mainThemes\"></div></div><div class=\"card\"><div class=\"eyebrow\">Screensaver theme</div><p class=\"notice\">Choose independently from all four standby designs.</p><div class=\"themes\" id=\"saverThemes\"></div></div><div class=\"card\"><div class=\"eyebrow\">Display behavior</div><div class=\"control-row\"><span>Screensaver</span><button class=\"btn switch\" id=\"saverFlag\" onclick=\"cmd('saver_toggle')\">\u2014</button></div><div class=\"control-row\"><span>Anti-flicker</span><button class=\"btn switch\" id=\"flickerFlag\" onclick=\"cmd('antiflick_toggle')\">\u2014</button></div><p class=\"notice\">Anti-flicker redraws a complete frame only when needed, preventing old digit fragments.</p></div><div class=\"card\"><div class=\"eyebrow\">Device connection</div><div class=\"control-row\"><span>Address</span><strong id=\"address\">\u2014</strong></div><div class=\"control-row\"><span>Last update</span><strong id=\"updated\">\u2014</strong></div></div></div></section>\n"
+"</main></div></div><div class=\"toast\" id=\"toast\"></div><script>\n"
+"const P=[['PLA',50,360],['PETG',60,360],['ABS',70,480],['ASA',70,480],['PA/NY',80,720],['PC',85,600]];let selected=0,state={mainTheme:0,saverTheme:0},tempData=[],humData=[];const $=id=>document.getElementById(id);function base(){return location.protocol.startsWith('http')?location.origin:'http://192.168.178.143'}async function get(path){const r=await fetch(base()+path,{cache:'no-store'});if(!r.ok)throw Error(await r.text());return r}async function cmd(a){try{await get('/cmd?action='+a);toast('Updated');await poll()}catch(e){toast(e.message)}}function toast(s){$('toast').textContent=s;$('toast').classList.add('on');setTimeout(()=>$('toast').classList.remove('on'),1800)}function showPage(p){document.querySelectorAll('.page').forEach(x=>x.classList.toggle('on',x.id===p));document.querySelectorAll('.nav button').forEach(x=>x.classList.toggle('on',x.dataset.page===p));if(p==='history')loadHistory()}document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>showPage(b.dataset.page));function fmtMin(m){return Math.floor(m/60)+':'+String(m%60).padStart(2,'0')}function buildPresets(){$('presets').innerHTML=P.map((p,i)=>`<button class=\"preset ${i===selected?'on':''}\" onclick=\"pick(${i})\"><b>${p[0]}</b><br>${p[1]}\u00b0C \u00b7 ${fmtMin(p[2])}</button>`).join('')}function pick(i){selected=i;$('target').value=P[i][1];$('duration').value=P[i][2];$('targetLabel').textContent=P[i][1]+'\u00b0C';$('durationLabel').textContent=fmtMin(P[i][2]);buildPresets()}function startDry(){cmd(`start&preset=${selected}&temp=${$('target').value}&min=${$('duration').value}`)}function themePreview(i,saver){if(i===0)return `<div class=\"preview\">20:06</div>`;if(i===1)return `<div class=\"preview ring\"></div>`;if(i===2)return `<div class=\"preview cards\"><i>${saver?'20:06':'38\u00b0'}</i><i>${saver?'02.08':'32%'}</i></div>`;return `<div class=\"preview split\"><i>20</i><i>06</i></div>`}function buildThemes(){const mn=['Modern Cards','Circular Dial','Minimal Industrial','Split Dashboard'],sn=['Minimal Glow','Data Cards','Orbit Dial','Modern Flip'];$('mainThemes').innerHTML=mn.map((n,i)=>`<button class=\"theme ${state.mainTheme===i?'on':''}\" onclick=\"setTheme('main',${i})\">${themePreview(i,false)}${n}</button>`).join('');$('saverThemes').innerHTML=sn.map((n,i)=>`<button class=\"theme ${state.saverTheme===i?'on':''}\" onclick=\"setTheme('saver',${i})\">${themePreview(i,true)}${n}</button>`).join('')}async function setTheme(k,i){await cmd(`theme&kind=${k}&value=${i}`)}function drawChart(id,data,color){const c=$(id),dpr=devicePixelRatio||1,w=c.clientWidth||400,h=c.clientHeight||150;c.width=w*dpr;c.height=h*dpr;const x=c.getContext('2d');x.scale(dpr,dpr);x.clearRect(0,0,w,h);x.strokeStyle='#263a5d';x.beginPath();for(let j=1;j<4;j++){x.moveTo(0,j*h/4);x.lineTo(w,j*h/4)}x.stroke();if(data.length<2)return;let min=Math.min(...data),max=Math.max(...data);if(max-min<1){min-=.5;max+=.5}x.strokeStyle=color;x.lineWidth=2;x.beginPath();data.forEach((v,i)=>{let px=i*w/(data.length-1),py=h-8-(v-min)*(h-16)/(max-min);i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()}async function poll(){try{let d=await(await get('/api')).json();state=d;$('online').textContent='\u25cf Connected';$('online').style.color='var(--green)';$('temp').textContent=d.t.toFixed(1);$('hum').textContent=d.h.toFixed(0);$('left').textContent=d.left;$('state').textContent=d.state;$('heater').textContent=d.heater?'ON':'OFF';$('fan').textContent=d.fan?'ON':'OFF';$('health').textContent=d.state.includes('E')?'Fault':'Normal';$('saverFlag').textContent=d.saverEnabled?'ON':'OFF';$('flickerFlag').textContent=d.antiFlicker?'ON':'OFF';$('updated').textContent=new Date().toLocaleTimeString();$('address').textContent=location.host;$('device-ip').textContent=location.host;let now=new Date();$('clock').textContent=now.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});$('date').textContent=now.toLocaleDateString([],{weekday:'long',day:'2-digit',month:'short',year:'numeric'});tempData.push(d.t);humData.push(d.h);if(tempData.length>60){tempData.shift();humData.shift()}drawChart('tempChart',tempData,'#ff8a1f');drawChart('humChart',humData,'#1597ff');buildThemes()}catch(e){$('online').textContent='\u25cf Disconnected';$('online').style.color='var(--red)'}}async function loadHistory(){try{let d=await(await get('/history')).json();$('historyBody').innerHTML=d.runs.length?d.runs.slice().reverse().map(r=>`<tr><td>${r.ts?new Date(r.ts*1000).toLocaleDateString():'\u2014'}</td><td>${r.preset}</td><td>${r.peak}\u00b0C</td><td>${r.startHum}\u2192${r.endHum}%</td><td>${r.outcome}</td></tr>`).join(''):'<tr><td colspan=\"5\" class=\"notice\">No runs yet</td></tr>'}catch(e){toast('History unavailable')}}async function clearHistory(){if(!confirm('Clear all run and fault history? This cannot be undone.'))return;try{await get('/history/clear');$('historyBody').innerHTML='<tr><td colspan=\"5\" class=\"notice\">History cleared</td></tr>';toast('History cleared')}catch(e){toast('Could not clear history')}}buildPresets();buildThemes();poll();setInterval(poll,2000);setInterval(()=>{$('clock').textContent=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})},1000);\n"
+"</script></body></html>\n"
 ;
+
 void handleRoot() {
   // Send PAGE in chunks — required for >8KB PROGMEM strings on ESP32 WebServer
   size_t pageLen = strlen_P(PAGE);
@@ -1707,20 +1430,24 @@ void handleHistory() {
 void handleClearHistory() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   runCount = 0; faultCount = 0;
+  memset(runLog, 0, sizeof(runLog));
+  memset(faultLog, 0, sizeof(faultLog));
   prefs.putInt("rcount", 0); prefs.putInt("fcount", 0);
+  prefs.remove("runs");
+  prefs.remove("faults");
   server.send(200, "text/plain", "cleared");
 }
 void handleApi()  {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   char tl[16] = "--:--:--";
-  if (screen == SCR_RUN) fmtTimeLeft(tl, sizeof(tl));
-  const char* st = screen == SCR_RUN ? "drying" :
+  if (screen == SCR_RUN || screen == SCR_SAVER) fmtTimeLeft(tl, sizeof(tl));
+  const char* st = (screen == SCR_RUN || screen == SCR_SAVER) ? "drying" :
                    screen == SCR_DONE ? "finished" :
                    screen == SCR_FAULT ? faultMsg : "idle";
   char buf[200];
   snprintf(buf, sizeof(buf),
-    "{\"t\":%.1f,\"h\":%.1f,\"left\":\"%s\",\"heater\":%d,\"fan\":%d,\"state\":\"%s\"}",
-    curTemp, curHum, tl, heaterOn ? 1 : 0, fanOn ? 1 : 0, st);
+    "{\"t\":%.1f,\"h\":%.1f,\"left\":\"%s\",\"heater\":%d,\"fan\":%d,\"state\":\"%s\",\"mainTheme\":%u,\"saverTheme\":%u,\"saverEnabled\":%d,\"antiFlicker\":%d}",
+    curTemp, curHum, tl, heaterOn ? 1 : 0, fanOn ? 1 : 0, st, mainTheme, saverTheme, saverEnabled?1:0, antiFlicker?1:0);
   server.send(200, "application/json", buf);
 }
 void handleCmd() {
@@ -1732,10 +1459,38 @@ void handleCmd() {
     return;
   }
   if (screen == SCR_FAULT) { server.send(409, "text/plain", "fault: reset blocked until cool"); return; }
+  if (a == "theme") {
+    String kind=server.arg("kind"); int v=constrain(server.arg("value").toInt(),0,3);
+    if(kind=="main") mainTheme=v; else if(kind=="saver") saverTheme=v; else {server.send(400,"text/plain","bad theme kind");return;}
+    saveThemePrefs();
+    if (screen == SCR_HOME) drawHome();
+    else if (screen == SCR_RUN) { drawRunStatic(); drawRunDynamic(); }
+    else if (screen == SCR_SAVER || screen == SCR_STANDBY) drawSaverFrame();
+    server.send(200,"text/plain","theme saved"); return;
+  }
+  if (a == "saver_toggle") { saverEnabled=!saverEnabled; saveThemePrefs(); server.send(200,"text/plain",saverEnabled?"screensaver on":"screensaver off"); return; }
+  if (a == "antiflick_toggle") { antiFlicker=!antiFlicker; saveThemePrefs(); server.send(200,"text/plain",antiFlicker?"anti-flicker on":"anti-flicker off"); return; }
+  if (a == "fan_on") {
+    manualFanMode = true;
+    fanWrite(true);
+    if (screen == SCR_HOME) drawHome();
+    server.send(200, "text/plain", "fan on"); return;
+  }
+  if (a == "fan_off") {
+    if (screen == SCR_RUN || screen == SCR_SAVER ||
+        (sensorOk && curTemp > COOLDOWN_TEMP)) {
+      server.send(409, "text/plain", "fan must remain on while drying or cooling"); return;
+    }
+    manualFanMode = false;
+    fanWrite(false);
+    if (screen == SCR_HOME) drawHome();
+    server.send(200, "text/plain", "fan off"); return;
+  }
   if (a == "stop") {
+    manualFanMode = false;
     heaterWrite(false);
     if (runStartMs > 0) { historySaveRun(1); runStartMs = 0; }
-    if (screen == SCR_RUN) { screen = SCR_HOME; drawHome(); }
+    if (screen == SCR_RUN || screen == SCR_SAVER || screen == SCR_STANDBY) { screen = SCR_HOME; drawHome(); }
     server.send(200, "text/plain", "ok"); return;
   }
   if (a == "start") {
@@ -1746,7 +1501,7 @@ void handleCmd() {
     if (t) setTemp = constrain(t, MIN_SET_TEMP, MAX_SET_TEMP);
     if (m) { m = constrain(m, 30, 24 * 60); setHours = m / 60; setMinutes = m % 60; }
     lastTouchMs = millis();   // prevent screensaver from triggering immediately after web start
-    if (screen != SCR_RUN) startRun();
+    if (screen != SCR_RUN && screen != SCR_SAVER) { startRun(); }
     server.send(200, "text/plain", "ok"); return;
   }
   server.send(400, "text/plain", "unknown action");
@@ -1863,15 +1618,24 @@ void wifiApplyNew() {   // from keyboard OK
   screen = SCR_SETTINGS;
   drawSettings();
 }
-void touchSettings(int tx, int ty) {
-  if (hit(tx, ty, 12,  160, 148, 50)) { screen = SCR_WIFI; drawWifiList(); return; }
-  if (hit(tx, ty, 172, 160, 148, 50)) { runTouchCalibration(); drawSettings(); return; }
-  if (hit(tx, ty, 332, 160, 136, 50)) { screen = SCR_HOME; drawHome(); return; }
-  if (hit(tx, ty, 12,  220, 290, 44)) {
-    saverEnabled = !saverEnabled;
-    prefs.putBool("saver", saverEnabled);
-    drawSettings();
-    return;
+void saveThemePrefs() {
+  prefs.putUChar("mainTheme",mainTheme); prefs.putUChar("saverTheme",saverTheme);
+  prefs.putBool("antiFlick",antiFlicker); prefs.putBool("saver",saverEnabled);
+}
+void touchSettings(int tx,int ty) {
+  if(hit(tx,ty,12,42,146,36)){settingsPage=0;drawSettings();return;}
+  if(hit(tx,ty,166,42,146,36)){settingsPage=1;drawSettings();return;}
+  if(hit(tx,ty,320,42,148,36)){screen=SCR_HOME;drawHome();return;}
+  if(settingsPage==0){
+    for(int i=0;i<4;i++) if(hit(tx,ty,12+i*116,104,108,62)){mainTheme=i;saveThemePrefs();drawSettings();return;}
+    for(int i=0;i<4;i++) if(hit(tx,ty,12+i*116,194,108,62)){saverTheme=i;saveThemePrefs();drawSettings();return;}
+    if(hit(tx,ty,12,270,144,38)){saverEnabled=!saverEnabled;saveThemePrefs();drawSettings();return;}
+    if(hit(tx,ty,168,270,144,38)){antiFlicker=!antiFlicker;saveThemePrefs();drawSettings();return;}
+    if(hit(tx,ty,324,270,144,38)){ tft.fillScreen(TFT_BLACK); drawSaverFrame(); delay(2500); drawSettings(); return; }
+  } else {
+    if(hit(tx,ty,12,184,140,48)){screen=SCR_WIFI;drawWifiList();return;}
+    if(hit(tx,ty,164,184,140,48)){runTouchCalibration();drawSettings();return;}
+    if(hit(tx,ty,316,184,152,48)){screen=SCR_HOME;drawHome();return;}
   }
 }
 
@@ -1879,6 +1643,7 @@ void touchSettings(int tx, int ty) {
 //                      RUN START
 // ---------------------------------------------------------------
 void startRun() {
+  manualFanMode = false;
   if (!sensorOk) { enterFault("E1 sensor lost"); return; }
   idleMode = false;   // cancel idle screensaver if active
   dispTemp = curTemp; dispHum = curHum;
@@ -1893,6 +1658,39 @@ void startRun() {
   lastTouchMs = millis();
   drawRunStatic();
   drawRunDynamic();
+}
+
+// Confirmed-touch filter. Raw resistive-panel noise must never reset the
+// inactivity timer or activate buttons. One action is generated per press.
+bool touchLatched = false;
+uint8_t touchStableCount = 0;
+uint16_t touchCandidateX = 0, touchCandidateY = 0;
+unsigned long touchReleaseSince = 0;
+
+bool getConfirmedTouch(uint16_t &x, uint16_t &y) {
+  uint16_t rx, ry;
+  bool raw = tft.getTouch(&rx, &ry, TOUCH_THRESHOLD);
+  unsigned long now = millis();
+  if (!raw) {
+    touchStableCount = 0;
+    if (touchLatched) {
+      if (touchReleaseSince == 0) touchReleaseSince = now;
+      if (now - touchReleaseSince > 80) { touchLatched = false; touchReleaseSince = 0; }
+    }
+    return false;
+  }
+  touchReleaseSince = 0;
+  if (touchLatched) return false;
+  if (touchStableCount == 0 || abs((int)rx-(int)touchCandidateX) > 18 || abs((int)ry-(int)touchCandidateY) > 18) {
+    touchCandidateX = rx; touchCandidateY = ry; touchStableCount = 1;
+    return false;
+  }
+  touchCandidateX = (touchCandidateX + rx) / 2;
+  touchCandidateY = (touchCandidateY + ry) / 2;
+  if (++touchStableCount < 3) return false;
+  x = touchCandidateX; y = touchCandidateY;
+  touchLatched = true; touchStableCount = 0;
+  return true;
 }
 
 // ---------------------------------------------------------------
@@ -1916,7 +1714,18 @@ void setup() {
 
   prefs.begin("dryer", false);
   saverEnabled = prefs.getBool("saver", true);
+  mainTheme = prefs.getUChar("mainTheme", 0) % 4;
+  saverTheme = prefs.getUChar("saverTheme", 0) % 4;
+  antiFlicker = prefs.getBool("antiFlick", true);
   historyLoad();   // load run log and fault log from NVS
+
+  // Runs are not resumed after reboot. Always boot safely to the home screen.
+  runStartMs = 0;
+  runEndMs = 0;
+  screen = SCR_HOME;
+  heaterWrite(false);
+  fanWrite(false);
+
   memset(tempBuf, 0, sizeof(tempBuf));
   if (prefs.getBytes("cal", calData, sizeof(calData)) == sizeof(calData)) {
     tft.setTouch(calData);
@@ -1930,14 +1739,19 @@ void setup() {
     sht4.setHeater(SHT4X_NO_HEATER);
   }
 
-  wifiInit();
-  otaInit();
+  // Draw the main display before Wi-Fi connection attempts. This guarantees
+  // visible local UI even when the router is unavailable or connection is slow.
   readSensor();
-  dispTemp = curTemp;   // seed display values from first real reading
+  dispTemp = curTemp;
   dispHum  = curHum;
   lastHumUpdateMs = millis();
   lastTouchMs = millis();
   drawHome();
+
+  wifiInit();
+  otaInit();
+  // Refresh once after Wi-Fi/NTP initialization to update the header status.
+  if (screen == SCR_HOME) drawHome();
 }
 
 void loop() {
@@ -1958,8 +1772,9 @@ void loop() {
     if (screen == SCR_HOME || screen == SCR_RUN) drawClock();
   }
 
-  // cooldown after run
-  if (screen == SCR_DONE || (screen == SCR_HOME && fanOn)) {
+  // Automatic cooldown after a run. Manual FAN ONLY mode stays on until the user turns it off.
+  if ((screen == SCR_DONE && !manualFanMode) ||
+      (screen == SCR_HOME && fanOn && !manualFanMode)) {
     if (sensorOk && curTemp <= COOLDOWN_TEMP) fanWrite(false);
     else if (screen == SCR_DONE) fanWrite(true);
   }
@@ -1968,34 +1783,35 @@ void loop() {
   server.handleClient();
   ArduinoOTA.handle();
 
-  // idle clock mode on home screen after 30s no touch
-  if (screen == SCR_HOME && !idleMode && now - lastTouchMs > IDLE_TIMEOUT_MS) {
-    idleMode = true;
-    drawIdleScreen(true);
+  // Home standby uses the selected screensaver theme, exactly like the drying saver.
+  if (ENABLE_IDLE_CLOCK && saverEnabled && screen == SCR_HOME && now - lastTouchMs > IDLE_TIMEOUT_MS) {
+    enterSaver(true);
     server.handleClient();
   }
-  // only animate idle when actually on home screen
-  if (idleMode && screen == SCR_HOME && now - lastIdleAnimMs >= 300) {
-    lastIdleAnimMs = now;
-    drawIdleScreen(false);
-    server.handleClient();   // serve requests queued during slow draw
-  }
-  // if screen changed away from home while idle, cancel idle mode
-  if (idleMode && screen != SCR_HOME) idleMode = false;
 
-  // screensaver disabled during drying — run screen stays visible always
+  // During drying, enter the selected full-screen saver after the configured timeout.
+  if (saverEnabled && screen == SCR_RUN && now - lastTouchMs > SAVER_TIMEOUT_MS) {
+    enterSaver();
+    server.handleClient();
+  }
 
   // animation + dynamic redraws
   if (now - lastAnimMs >= 120) {
     lastAnimMs = now; animFrame++;
     switch (screen) {
-      case SCR_RUN:
-        drawAnimStrip();
-        if (animFrame % 8 == 0) drawRunDynamic();
+      case SCR_RUN: {
+        // Fixed one-second cadence; fields repaint only when their displayed value changes.
+        static unsigned long lastRunUiDraw = 0;
+        if (now - lastRunUiDraw >= 1000UL) { lastRunUiDraw = now; drawRunDynamic(); }
         break;
+      }
       case SCR_SAVER:
-        drawSaverAnimations();
+      case SCR_STANDBY: {
+        static unsigned long lastSaverDraw = 0;
+        unsigned long saverInterval = (screen == SCR_STANDBY) ? 5000UL : (antiFlicker ? 1000UL : 500UL);
+        if (now - lastSaverDraw >= saverInterval) { lastSaverDraw = now; drawSaverAnimations(); }
         break;
+      }
       case SCR_DONE:  drawDoneAnim(); break;
       case SCR_FAULT: if (animFrame % 8 == 0) faultTick(); break;
       case SCR_HOME:
@@ -2007,13 +1823,13 @@ void loop() {
 
   // touch
   uint16_t tx, ty;
-  if (tft.getTouch(&tx, &ty, TOUCH_THRESHOLD)) {
+  if (getConfirmedTouch(tx, ty)) {
     lastTouchMs = now;
-    if (idleMode) { touchIdleScreen(tx, ty); delay(120); }
-    else switch (screen) {
+    switch (screen) {
       case SCR_HOME:     touchHome(tx, ty);     break;
       case SCR_RUN:      touchRun(tx, ty);      break;
-      case SCR_SAVER:    exitSaver();           break;
+      case SCR_SAVER:
+      case SCR_STANDBY:  exitSaver();           break;
       case SCR_DONE:     touchDone(tx, ty);     break;
       case SCR_SETTINGS: touchSettings(tx, ty); break;
       case SCR_WIFI:     touchWifiList(tx, ty); break;
