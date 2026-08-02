@@ -4,6 +4,23 @@ A complete ESP32-based controller mod for the Creality Space Pi filament dryer, 
 
 ---
 
+## Live diagrams
+
+> **Enable GitHub Pages** (Settings → Pages → Source: main / root) to make these links work.  
+> Or paste any URL into **https://htmlpreview.github.io/** to preview HTML files without Pages.
+
+| Diagram | Link |
+|---|---|
+| Complete system wiring | [View diagram](https://mehregan59.github.io/Filament-dryer/wiring/wiring_complete.html) |
+| IRLZ44N MOSFET pin detail | [View diagram](https://mehregan59.github.io/Filament-dryer/wiring/mosfet_detail.html) |
+| Web control app | [Open app](https://mehregan59.github.io/Filament-dryer/web/dryer_webapp.html) |
+
+**To enable GitHub Pages in 60 seconds:**  
+Repo → Settings → Pages → Source → Deploy from branch → Branch: main → Folder: / (root) → Save.  
+Wait ~2 min, then the links above will work for anyone.
+
+---
+
 ## Why we built this
 
 The stock Creality Space Pi is limited to 70 °C by firmware and develops an E4 error (timeout: setpoint not reached) near its ceiling. The stock board uses a triac with no accessible firmware and a single NTC sensor. For drying Nylon (PA) or PC filament you need 80–85 °C — not achievable with the stock system.
@@ -11,7 +28,7 @@ The stock Creality Space Pi is limited to 70 °C by firmware and develops an E4 
 Rather than sensor-offset hacks (which make the display lie), we replaced the entire control side with an ESP32 display board, an SSR, and a precision SHT40 sensor. The result:
 
 - True, displayed, tunable temperature up to 85 °C
-- Animated touch UI with presets, screensaver, idle clock
+- Animated touch UI with presets, screensaver, idle clock with constellation animation
 - WiFi with NTP clock, on-screen network picker, and a full mobile/desktop web app
 - Three independent safety layers: firmware ceiling (92 °C), thermal runaway detection, physical thermal fuse
 - Full remote control from any phone browser on the same WiFi network
@@ -27,12 +44,12 @@ firmware/
 web/
   dryer_webapp.html        # Responsive web app — open in any browser, no install
 wiring/
-  wiring_complete.html     # Full system wiring diagram (open in browser)
+  wiring_complete.html     # Full system wiring diagram (interactive, open in browser)
   mosfet_detail.html       # IRLZ44N pin detail diagram
 docs/
   BOM.md                   # Bill of materials with part numbers and suppliers
   SAFETY.md                # Safety design rationale
-media/                     # Photos, videos, 3D files (added by owner)
+media/                     # Photos, videos, 3D files (add your own here)
 ```
 
 ---
@@ -58,9 +75,16 @@ See [docs/BOM.md](docs/BOM.md) for the complete part list. Summary:
 
 ---
 
-## Wiring overview
+## Wiring
 
-Open `wiring/wiring_complete.html` in a browser for the full colour-coded diagram. Summary:
+The wiring diagrams are colour-coded HTML/SVG files — open them in any browser.
+
+**Wire colours in the diagram:**
+- 🔴 Red — 220V mains Live path
+- 🟡 Yellow — 12V DC
+- 🔵 Blue — 5V DC
+- 🟢 Green — control signals (IO25 heater, IO32 fan gate)
+- ⚫ Dark grey — common ground
 
 **Mains path (220V):**
 Inlet Live → 2A fuse → Wago (splits to PSU-L and SSR output-1) → SSR output-2 → thermal fuse → heater wire 1. Heater wire 2 → Neutral Wago → PSU-N → back to inlet Neutral.
@@ -69,8 +93,8 @@ Inlet Live → 2A fuse → Wago (splits to PSU-L and SSR output-1) → SSR outpu
 PSU 12V+ → fans+ (direct, always on) and buck IN+. Buck OUT 5V → ESP32 PWR. All grounds common: PSU−, buck−, ESP32 GND, MOSFET source, SSR input−.
 
 **Control signals:**
-- ESP32 IO25 → SSR input+ (heater control, opto-isolated)
-- ESP32 IO32 → 100Ω → MOSFET gate (fan control); 10kΩ gate to GND
+- ESP32 IO25 → SSR input+ (heater, opto-isolated)
+- ESP32 IO32 → 100Ω → MOSFET gate (fans); 10kΩ gate to GND
 - ESP32 IO22 SDA, IO21 SCL → SHT40 I2C connector
 
 **IRLZ44N pinout** (label facing you, legs pointing down): Gate = left, Drain = middle/tab, Source = right.
@@ -84,7 +108,7 @@ See [firmware/README_firmware.md](firmware/README_firmware.md) for full instruct
 1. Install Arduino IDE 2.x, board: **ESP32 Dev Module** (Espressif core, not Arduino's Nano ESP32).
 2. Libraries: **TFT_eSPI** (Bodmer), **Adafruit SHT4x** (+ its dependencies).
 3. Edit `Documents/Arduino/libraries/TFT_eSPI/User_Setup.h` — use the pin block in README_firmware.md.
-4. Edit `WIFI_SSID` / `WIFI_PASS` in the sketch, or leave them and configure WiFi from the device's Settings screen.
+4. Edit `WIFI_SSID` / `WIFI_PASS` in the sketch, or configure WiFi from the device's Settings screen.
 5. Upload at **115200 baud** (Tools → Upload Speed). Hold BOOT + tap RESET if upload hangs at `Connecting...`.
 6. First boot: touch calibration runs automatically. Repeat via Settings → CALIBRATE after mounting.
 
@@ -92,7 +116,7 @@ See [firmware/README_firmware.md](firmware/README_firmware.md) for full instruct
 
 ## Web app
 
-Open `web/dryer_webapp.html` in any browser. Go to Settings, enter the IP shown on the dryer's screen, tap Connect. The app polls every 2 seconds over local WiFi — no internet required, no install.
+Open `web/dryer_webapp.html` in any browser, or use the [live link](https://mehregan59.github.io/Filament-dryer/web/dryer_webapp.html) if GitHub Pages is enabled. Go to Settings, enter the IP shown on the dryer's screen, tap Connect. The app polls every 2 seconds over local WiFi — no internet required, no install.
 
 Features: live temp/humidity, countdown timer with progress bar, animated heater/fan status, 20-minute history chart, full preset and parameter control, fault reset.
 
@@ -102,9 +126,9 @@ Features: live temp/humidity, countdown timer with progress bar, animated heater
 
 Three independent layers — each works even when the others fail:
 
-1. **Firmware:** 92 °C hard cutoff (E2), thermal runaway detection after 4 min no rise (E3), sensor-loss fault (E1). Fault reset gated by confirmed cool-down. SSR control from IO25 only — remote web reset uses the same gate as the touch button.
+1. **Firmware:** 92 °C hard cutoff (E2), thermal runaway detection after 4 min no rise (E3), sensor-loss fault (E1). Fault reset gated by confirmed cool-down.
 2. **2A inline fuse:** protects the heater Live wire against overcurrent. Independent of all software.
-3. **133 °C thermal fuse (SF133E):** clamped to the heater body in series with Live. Trips on no-software-required physics if the SSR welds shut or the ESP32 hangs with the heater on. Installed with non-insulated copper butt crimps and 200 °C silicone sleeve — never soldered (heat travels up leads and trips the fuse during installation).
+3. **133 °C thermal fuse (SF133E):** clamped to the heater body in series with Live. Trips on physics alone if the SSR welds shut. Installed with non-insulated copper butt crimps and 200 °C silicone sleeve — never soldered.
 
 See [docs/SAFETY.md](docs/SAFETY.md) for the full rationale.
 
@@ -112,13 +136,13 @@ See [docs/SAFETY.md](docs/SAFETY.md) for the full rationale.
 
 ## Adding your own media
 
-Add photos, videos, and 3D files to the `media/` folder. Suggested structure:
+Add photos, videos, and 3D files to the `media/` folder:
 
 ```
 media/
   photos/      # Build photos, finished unit
   videos/      # Demo videos
-  3d/          # STL/STEP files for LCD cover and case
+  3d/          # STL/STEP files for LCD cover and case replacement
 ```
 
 ---
