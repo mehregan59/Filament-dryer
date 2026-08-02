@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SpacePi Filament Dryer — Mod v01 Mike</title>
+<style>
+:root {
+  --bg: #0a0e1a; --bg2: #111827; --card: #1a2035;
+  --border: #2a3a55; --text: #e8edf5; --muted: #6b7a99;
+  --accent: #0af; --hot: #f80; --good: #0c6; --bad: #e33;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, sans-serif; min-height: 100vh; }
+header { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 24px 32px; display: flex; align-items: center; gap: 20px; }
+.logo { font-size: 22px; font-weight: 700; }
+.logo span { color: var(--accent); font-size: 13px; font-weight: 400; display: block; margin-top: 2px; }
+.badge { background: rgba(0,170,255,0.15); color: var(--accent); border: 1px solid rgba(0,170,255,0.3); padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+main { max-width: 960px; margin: 0 auto; padding: 40px 24px; }
+h2 { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; margin: 36px 0 14px; }
+h2:first-of-type { margin-top: 0; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; text-decoration: none; color: var(--text); display: block; transition: border-color 0.15s; position: relative; overflow: hidden; }
+.card:hover { border-color: var(--accent); }
+.card-icon { font-size: 28px; margin-bottom: 14px; }
+.card-title { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
+.card-desc { font-size: 13px; color: var(--muted); line-height: 1.6; }
+.card-arrow { position: absolute; top: 24px; right: 24px; color: var(--muted); font-size: 18px; }
+.card:hover .card-arrow { color: var(--accent); }
+.card.primary { border-color: rgba(0,170,255,0.4); }
+.card.primary .card-title { color: var(--accent); }
+.tag { display: inline-block; background: rgba(0,200,100,0.12); color: var(--good); border: 1px solid rgba(0,200,100,0.25); padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-top: 10px; }
+.tag.warn { background: rgba(255,136,0,0.12); color: var(--hot); border-color: rgba(255,136,0,0.25); }
+table { width: 100%; border-collapse: collapse; }
+td, th { padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 14px; text-align: left; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+tr:last-child td { border-bottom: none; }
+.tbl-wrap { background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; margin-bottom: 16px; }
+.safety { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+.safety-item { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+.safety-num { font-size: 28px; font-weight: 800; color: var(--accent); opacity: 0.4; line-height: 1; margin-bottom: 8px; }
+.safety-title { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+.safety-desc { font-size: 13px; color: var(--muted); line-height: 1.6; }
+footer { border-top: 1px solid var(--border); padding: 24px 32px; text-align: center; font-size: 13px; color: var(--muted); margin-top: 60px; }
+footer a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">SpacePi Filament Dryer <span>Mod v01 Mike</span></div>
+  <div class="badge">ESP32 · 85 °C · WiFi</div>
+</header>
+
+<main>
+
+  <h2>Diagrams and tools</h2>
+  <div class="grid">
+    <a class="card primary" href="wiring/wiring_complete.html">
+      <div class="card-arrow">↗</div>
+      <div class="card-icon">⚡</div>
+      <div class="card-title">Complete wiring diagram</div>
+      <div class="card-desc">Full colour-coded system: 220V mains path, 12V DC rail, 5V ESP32 supply, SSR control, MOSFET fan switch, SHT40 sensor.</div>
+      <div class="tag">Interactive SVG</div>
+    </a>
+    <a class="card" href="wiring/mosfet_detail.html">
+      <div class="card-arrow">↗</div>
+      <div class="card-icon">🔌</div>
+      <div class="card-title">IRLZ44N pin detail</div>
+      <div class="card-desc">Gate, Drain, Source pinout with resistor connections. Shows the 100 Ω gate resistor and 10 kΩ pulldown exactly where they go.</div>
+      <div class="tag">Interactive SVG</div>
+    </a>
+    <a class="card" href="web/dryer_webapp.html">
+      <div class="card-arrow">↗</div>
+      <div class="card-icon">📱</div>
+      <div class="card-title">Web control app</div>
+      <div class="card-desc">Responsive web app. Enter your dryer's IP in Settings and control it from any phone, tablet or desktop on the same WiFi.</div>
+      <div class="tag">Phone · Tablet · Desktop</div>
+    </a>
+    <a class="card" href="https://github.com/mehregan59/Filament-dryer">
+      <div class="card-arrow">↗</div>
+      <div class="card-icon">💾</div>
+      <div class="card-title">GitHub repository</div>
+      <div class="card-desc">Full source: ESP32 firmware, BOM, safety rationale, firmware setup guide. Upload your photos and 3D files to media/.</div>
+      <div class="tag">MIT licence</div>
+    </a>
+  </div>
+
+  <h2>Why this exists</h2>
+  <p style="font-size:14px;color:var(--muted);line-height:1.8;max-width:700px">
+    The stock Creality Space Pi tops out at 70 °C by firmware and throws an E4 error near its ceiling. PA/Nylon needs 80 °C and PC needs 85 °C — neither is achievable stock. Rather than sensor-offset hacks that make the display lie, we replaced the entire control side with an ESP32, an SSR-40DA, and a precision SHT40 sensor. The result is a true, displayed, tunable temperature up to 85 °C with three independent safety layers.
+  </p>
+
+  <h2>Filament presets</h2>
+  <div class="tbl-wrap">
+    <table>
+      <tr><th>Filament</th><th>Target</th><th>Duration</th><th>Notes</th></tr>
+      <tr><td>PLA</td><td>50 °C</td><td>6 h</td><td style="color:var(--muted)">Removes moisture before printing</td></tr>
+      <tr><td>PETG</td><td>60 °C</td><td>6 h</td><td style="color:var(--muted)">More hygroscopic than PLA</td></tr>
+      <tr><td>ABS</td><td>70 °C</td><td>8 h</td><td style="color:var(--muted)">Stock dryer ceiling — this mod exceeds it</td></tr>
+      <tr><td>ASA</td><td>70 °C</td><td>8 h</td><td style="color:var(--muted)"></td></tr>
+      <tr><td style="color:var(--hot)">PA / Nylon</td><td style="color:var(--hot)">80 °C</td><td>12 h</td><td style="color:var(--muted)">Requires this mod</td></tr>
+      <tr><td style="color:var(--bad)">PC</td><td style="color:var(--bad)">85 °C</td><td>10 h</td><td style="color:var(--muted)">Maximum — requires this mod</td></tr>
+    </table>
+  </div>
+  <p style="font-size:12px;color:var(--muted)">All presets are adjustable ±5 °C and ±30 min from the touch screen or web app.</p>
+
+  <h2>Safety architecture</h2>
+  <div class="safety">
+    <div class="safety-item">
+      <div class="safety-num">01</div>
+      <div class="safety-title">Firmware limits</div>
+      <div class="safety-desc">92 °C hard ceiling (E2), thermal runaway after 4 min no rise (E3), sensor-loss fault (E1). Fault reset gated by confirmed cool-down below 50 °C.</div>
+    </div>
+    <div class="safety-item">
+      <div class="safety-num">02</div>
+      <div class="safety-title">2A inline fuse</div>
+      <div class="safety-desc">In the heater Live wire. Rated for overcurrent — independent of all software. The one component that works even if the ESP32 is dead.</div>
+    </div>
+    <div class="safety-item">
+      <div class="safety-num">03</div>
+      <div class="safety-title">133 °C thermal fuse</div>
+      <div class="safety-desc">SF133E clamped to the heater body. Trips on physics alone if the SSR welds shut. Installed with copper crimps and 200 °C silicone sleeve — never soldered.</div>
+    </div>
+  </div>
+
+  <h2>Key components</h2>
+  <div class="tbl-wrap">
+    <table>
+      <tr><th>Part</th><th>Role</th></tr>
+      <tr><td>Elecrow WZ3248R035 (ESP32-WROOM-32)</td><td style="color:var(--muted)">Controller + 3.5" touch display</td></tr>
+      <tr><td>SSR-40DA solid state relay</td><td style="color:var(--muted)">Switches 220V heater — opto-isolated</td></tr>
+      <tr><td>Mean Well RS-25-12</td><td style="color:var(--muted)">220V → 12V PSU</td></tr>
+      <tr><td>MP1584 buck module</td><td style="color:var(--muted)">12V → 5V for ESP32</td></tr>
+      <tr><td>IRLZ44N + 100 Ω + 10 kΩ</td><td style="color:var(--muted)">Switches 12V fans from IO32</td></tr>
+      <tr><td>Adafruit SHT40</td><td style="color:var(--muted)">Temp + humidity — rated to 125 °C</td></tr>
+      <tr><td>SEFUSE SF133E</td><td style="color:var(--muted)">Thermal fuse — hardware last resort</td></tr>
+    </table>
+  </div>
+
+</main>
+
+<footer>
+  SpacePi Filament Dryer — Mod v01 Mike &nbsp;·&nbsp;
+  <a href="https://github.com/mehregan59/Filament-dryer">GitHub</a> &nbsp;·&nbsp;
+  MIT licence
+</footer>
+
+</body>
+</html>
