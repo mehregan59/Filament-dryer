@@ -335,11 +335,20 @@ void controlLoop() {
   if (curTemp > (float)setTemp + hystHigh) want = false;
 
   if (want && !heaterOn) { rwArmed = true; rwStartMs = millis(); rwStartTemp = curTemp; }
-  if (!want) rwArmed = false;
-  if (rwArmed && heaterOn && (curTemp < setTemp - 5)) {
-    if (millis() - rwStartMs > RUNAWAY_WINDOW_MS) {
-      if (curTemp - rwStartTemp < RUNAWAY_MIN_RISE) { enterFault("E3 no heat rise"); return; }
-      rwStartMs = millis(); rwStartTemp = curTemp;
+  if (!want) { rwArmed = false; }
+  if (rwArmed && heaterOn) {
+    // Thermal runaway window is longer at high targets — PTC heaters rise slowly above 70C
+    unsigned long window = (setTemp >= 70) ? 480000UL : RUNAWAY_WINDOW_MS;  // 8 min vs 4 min
+    // Minimum rise is smaller at high temps — 0.5C in 8 min is still real progress
+    float minRise = (setTemp >= 70) ? 0.5f : RUNAWAY_MIN_RISE;
+    if (millis() - rwStartMs > window) {
+      if (curTemp - rwStartTemp < minRise) {
+        enterFault("E3 no heat rise");
+        return;
+      }
+      // reset window — keep checking each window
+      rwStartMs = millis();
+      rwStartTemp = curTemp;
     }
   }
   heaterWrite(want);
