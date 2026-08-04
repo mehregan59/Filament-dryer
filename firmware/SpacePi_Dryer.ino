@@ -334,19 +334,26 @@ void controlLoop() {
   if (curTemp < (float)setTemp - hystLow)  want = true;
   if (curTemp > (float)setTemp + hystHigh) want = false;
 
-  if (want && !heaterOn) { rwArmed = true; rwStartMs = millis(); rwStartTemp = curTemp; }
-  if (!want) { rwArmed = false; }
+  if (want && !heaterOn) {
+    // Only start runaway timer if not already armed and not yet at target
+    if (!rwArmed && curTemp < (float)setTemp - 8.0f) {
+      rwArmed = true; rwStartMs = millis(); rwStartTemp = curTemp;
+    }
+  }
+  if (!want && curTemp >= (float)setTemp - hystHigh) {
+    // Heater cut because we reached target — disable runaway check permanently for this run
+    // Normal cycling (on/off around setpoint) must never trigger E3
+    rwArmed = false;
+  }
   if (rwArmed && heaterOn) {
-    // Thermal runaway window is longer at high targets — PTC heaters rise slowly above 70C
-    unsigned long window = (setTemp >= 70) ? 480000UL : RUNAWAY_WINDOW_MS;  // 8 min vs 4 min
-    // Minimum rise is smaller at high temps — 0.5C in 8 min is still real progress
-    float minRise = (setTemp >= 70) ? 0.5f : RUNAWAY_MIN_RISE;
+    unsigned long window = (setTemp >= 70) ? 600000UL : 300000UL;  // 10 min high, 5 min low
     if (millis() - rwStartMs > window) {
-      if (curTemp - rwStartTemp < minRise) {
+      float rise = curTemp - rwStartTemp;
+      if (rise < 1.0f) {   // less than 1C rise in window = genuine fault
         enterFault("E3 no heat rise");
         return;
       }
-      // reset window — keep checking each window
+      // still rising — extend window from current position
       rwStartMs = millis();
       rwStartTemp = curTemp;
     }
@@ -1136,19 +1143,26 @@ void drawFault() {
   faultResetShown = false;
   tft.fillScreen(0x4000);
   tft.setTextColor(C_TEXT, 0x4000); tft.setTextDatum(MC_DATUM);
-  tft.drawString("FAULT", 240, 90, 4);
-  tft.drawString(faultMsg, 240, 140, 4);
+  tft.drawString("FAULT", 240, 70, 4);
+  tft.drawString(faultMsg, 240, 118, 4);
   tft.setTextColor(0xFDB8, 0x4000);
-  tft.drawString("heater off, fans on", 240, 190, 2);
-  tft.drawString(sensorOk ? "reset unlocks below 50 C"
-                          : "reset unlocks after 10 min cooling", 240, 214, 2);
+  tft.drawString("heater off, fans on", 240, 166, 2);
+  tft.drawString(sensorOk ? "safe reset below 50 C"
+                          : "safe reset after 10 min", 240, 190, 2);
+  // RESTART button — always visible, heater stays off, clears fault and goes home
+  btn(12, 240, 220, 50, "RESTART (safe)", C_CARD);
+  // RESET button appears only when cool
+  tft.drawString(sensorOk ? "or wait to cool for full reset" : "", 240, 304, 2);
 }
 void faultTick() {
   if (!faultResetShown && faultUnlocked()) {
     faultResetShown = true;
-    btn(140, 244, 200, 54, "RESET", C_CARD);
+    btn(244, 240, 224, 50, "RESET + RESUME", C_GOOD, 0x0000);
   }
-  if (faultResetShown) return;
+  if (faultResetShown) {
+    // keep resume button visible — no temp display needed
+    return;
+  }
   char v[16];
   if (sensorOk) snprintf(v, sizeof(v), "%.1f C", curTemp);
   else {
@@ -1157,7 +1171,7 @@ void faultTick() {
   }
   tft.setTextColor(C_TEXT, 0x4000); tft.setTextDatum(MC_DATUM);
   tft.setTextPadding(110);
-  tft.drawString(v, 240, 234, 2);
+  tft.drawString(v, 240, 218, 2);
   tft.setTextPadding(0);
 }
 void resetFault() {
@@ -1167,7 +1181,20 @@ void resetFault() {
   drawHome();
 }
 void touchFault(int tx, int ty) {
-  if (faultResetShown && hit(tx, ty, 140, 244, 200, 54)) resetFault();
+  // RESTART (safe) — always available, heater stays off, clears fault, goes home
+  // Fan keeps running if still hot (cooling continues automatically)
+  if (hit(tx, ty, 12, 240, 220, 50)) {
+    faultMsg[0] = 0;
+    screen = SCR_HOME;
+    heaterWrite(false);
+    fanWrite(sensorOk && curTemp > COOLDOWN_TEMP);  // keep fan if still hot
+    drawHome();
+    return;
+  }
+  // RESET + RESUME — only when unlocked (cool enough), full reset
+  if (faultResetShown && hit(tx, ty, 244, 240, 224, 50)) {
+    resetFault();
+  }
 }
 
 // ---------------------------------------------------------------
